@@ -64,6 +64,14 @@ pub struct AddRemoteArgs {
     /// Extra ssh arguments, e.g. --ssh-option=-p --ssh-option=2222.
     #[arg(long = "ssh-option", value_name = "ARG")]
     pub ssh_options: Vec<String>,
+
+    /// Run the remote command through a login shell.
+    ///
+    /// Use when contextd is installed there but `ssh host contextd` cannot
+    /// find it: a non-interactive shell never reads the profile that puts
+    /// ~/.local/bin or ~/.cargo/bin on PATH.
+    #[arg(long)]
+    pub login_shell: bool,
 }
 
 #[derive(Debug, Args)]
@@ -114,6 +122,10 @@ pub struct ScanArgs {
     /// Extra ssh arguments, e.g. --ssh-option=-p --ssh-option=2222.
     #[arg(long = "ssh-option", value_name = "ARG")]
     pub ssh_options: Vec<String>,
+
+    /// Run the remote command through a login shell (see `remote add`).
+    #[arg(long)]
+    pub login_shell: bool,
 
     /// Show the category breakdown for every project.
     #[arg(long)]
@@ -242,6 +254,7 @@ fn add(app: &App, global: &GlobalArgs, args: &AddRemoteArgs) -> Result<()> {
         command: args.command.clone(),
         home: args.remote_home.clone(),
         ssh_options: args.ssh_options.clone(),
+        login_shell: args.login_shell,
     };
     remote.validate()?;
 
@@ -262,6 +275,7 @@ fn add(app: &App, global: &GlobalArgs, args: &AddRemoteArgs) -> Result<()> {
                 ("host", remote.host.clone()),
                 ("command", remote.command.clone()),
                 ("home", remote.home.clone().unwrap_or_else(|| "default".into())),
+                ("shell", if remote.login_shell { "login".into() } else { "default".into() }),
             ]),
             ui::hint(&format!(
                 "Try `contextd remote pull {} --dry-run` to check the connection.",
@@ -328,6 +342,7 @@ fn scan(app: &App, global: &GlobalArgs, args: &ScanArgs) -> Result<()> {
                 command: args.command.clone(),
                 home: args.remote_home.clone(),
                 ssh_options: args.ssh_options.clone(),
+                login_shell: args.login_shell,
             })?
             .with_interaction(interaction),
             false,

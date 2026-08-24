@@ -262,6 +262,13 @@ pub struct RemoteConfig {
     pub home: Option<String>,
     /// Extra arguments passed to `ssh` (`-p 2222`, `-i key`, `-J jump`, …).
     pub ssh_options: Vec<String>,
+    /// Run the remote command through a login shell.
+    ///
+    /// `ssh host command` uses a non-interactive, non-login shell, which on a
+    /// stock Ubuntu never reaches the part of `~/.bashrc` that adds
+    /// `~/.local/bin` or `~/.cargo/bin` to `PATH`. A login shell reads
+    /// `~/.profile` and finds them.
+    pub login_shell: bool,
 }
 
 impl Default for RemoteConfig {
@@ -272,6 +279,7 @@ impl Default for RemoteConfig {
             command: "contextd".into(),
             home: None,
             ssh_options: Vec::new(),
+            login_shell: false,
         }
     }
 }

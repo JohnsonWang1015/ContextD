@@ -255,7 +255,9 @@ fn scanning_a_machine_without_contextd_explains_the_fix() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not on the PATH"), "stderr: {stderr}");
+    assert!(stderr.contains("was not found on"), "stderr: {stderr}");
+    assert!(stderr.contains("command -v contextd"), "stderr: {stderr}");
+    assert!(stderr.contains("--login-shell"), "stderr: {stderr}");
     assert!(stderr.contains("--command"), "stderr: {stderr}");
 }
 

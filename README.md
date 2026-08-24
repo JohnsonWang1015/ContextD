@@ -225,6 +225,31 @@ MCP server — it passes `BatchMode=yes` so a missing key fails immediately
 instead of hanging on a prompt nobody will answer. Force either way with
 `--interactive` or `--batch`.
 
+### When the remote has contextd but ssh cannot find it
+
+`ssh host command` runs a non-interactive, non-login shell, and a stock
+`~/.bashrc` returns immediately for those — before the lines that put
+`~/.local/bin` or `~/.cargo/bin` on `PATH`. So `contextd` can be installed and
+working over there and still be "not found". Which case you are in:
+
+```sh
+ssh you@host 'command -v contextd'                  # nothing? not installed
+ssh you@host 'bash -lc "command -v contextd"'       # found? a PATH problem
+```
+
+Either fix works:
+
+```sh
+contextd remote add lab you@host --login-shell               # read ~/.profile first
+contextd remote add lab you@host --command ~/.local/bin/contextd
+```
+
+A `~/`-relative command path is expanded on the remote rather than quoted, and
+a login shell that prints a banner does not break anything — the JSON payload
+is picked out of the output.
+
+### Asking once instead of every time
+
 Each command opens its own connection, so `scan` then `pull` asks twice. Two
 ways to stop that:
 

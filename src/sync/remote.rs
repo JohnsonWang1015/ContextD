@@ -134,7 +134,15 @@ impl SshTransport {
         }
         parts.push(shell_quote(&self.config.command));
         parts.extend(args.iter().map(|arg| shell_quote(arg)));
-        parts.join(" ")
+        let command = parts.join(" ");
+
+        if self.config.login_shell {
+            // A login shell reads ~/.profile, which is where PATH additions
+            // for ~/.local/bin and ~/.cargo/bin normally live.
+            format!("bash -lc {}", shell_quote(&command))
+        } else {
+            command
+        }
     }
 }
 
@@ -187,8 +195,38 @@ impl RemoteTransport for SshTransport {
     }
 }
 
+/// The JSON document in a remote command's output.
+///
+/// A login shell may print a banner, a message of the day or a stray `echo`
+/// from someone's profile before the command runs. The payload is always a
+/// single line of JSON, so the last line that looks like one is taken rather
+/// than failing over the noise in front of it.
+fn json_payload(stdout: &str) -> &str {
+    let trimmed = stdout.trim();
+    if trimmed.starts_with('{') {
+        return trimmed;
+    }
+    trimmed
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with('{') && line.ends_with('}'))
+        .unwrap_or(trimmed)
+}
+
 /// Quote one argument for a POSIX remote shell.
+///
+/// A leading `~/` is translated rather than quoted: `'~/.local/bin/contextd'`
+/// would reach the remote shell as a literal tilde and fail, which is exactly
+/// the path someone reaches for when contextd is not on the default PATH.
 fn shell_quote(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix("~/") {
+        return format!("\"$HOME\"/{}", quote_plain(rest));
+    }
+    quote_plain(value)
+}
+
+fn quote_plain(value: &str) -> String {
     if !value.is_empty()
         && value
             .chars()
@@ -241,7 +279,7 @@ impl<'a> RemoteSync<'a> {
             .run(&["inventory".to_string(), "--json".to_string()], None)
             .map_err(|err| explain_remote_failure(transport, err))?;
 
-        Inventory::from_json(stdout.trim()).map_err(|err| {
+        Inventory::from_json(json_payload(&stdout)).map_err(|err| {
             Error::Other(anyhow::anyhow!(
                 "{} did not return an inventory ({err}). Older builds do not have \
                  `contextd inventory`; upgrade contextd there, or use \
@@ -272,7 +310,7 @@ impl<'a> RemoteSync<'a> {
 
         let stdout =
             transport.run(&args, None).map_err(|err| explain_remote_failure(transport, err))?;
-        let bundle = Bundle::from_json(stdout.trim()).map_err(|err| {
+        let bundle = Bundle::from_json(json_payload(&stdout)).map_err(|err| {
             Error::Other(anyhow::anyhow!(
                 "{} did not return a bundle ({err}); is contextd installed there?",
                 transport.describe()
@@ -317,7 +355,7 @@ impl<'a> RemoteSync<'a> {
         let stdout = transport.run(&args, Some(&bundle.to_json()?))?;
         // The remote answers with its own merge report; parsing it is what
         // makes `push` report real numbers rather than "probably fine".
-        let merge: MergeReport = serde_json::from_str(stdout.trim()).map_err(|err| {
+        let merge: MergeReport = serde_json::from_str(json_payload(&stdout)).map_err(|err| {
             Error::Other(anyhow::anyhow!(
                 "{} did not return a merge report ({err}): {}",
                 transport.describe(),
@@ -359,9 +397,13 @@ fn explain_remote_failure(transport: &dyn RemoteTransport, err: Error) -> Error 
     }
     if text.contains("command not found") || text.contains("No such file or directory") {
         return Error::Other(anyhow::anyhow!(
-            "contextd is not on the PATH for {}. Install it there, or point at it with \
-             `contextd remote add <name> <host> --command /path/to/contextd`.",
-            transport.describe()
+            "contextd was not found on {}. Check with `ssh {dest} 'command -v contextd'`:\n\
+             \u{20} · nothing there → install it on that machine\n\
+             \u{20} · found only via `ssh {dest} 'bash -lc \"command -v contextd\"'` → its PATH is \
+             set up for login shells only, so add --login-shell to the remote\n\
+             \u{20} · installed elsewhere → point at it with --command /path/to/contextd",
+            transport.describe(),
+            dest = transport.destination().unwrap_or("user@host")
         ));
     }
     err
@@ -597,7 +639,9 @@ mod tests {
 
         let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
         let err = RemoteSync::new(&local).scan(&Missing).unwrap_err().to_string();
-        assert!(err.contains("not on the PATH"), "{err}");
+        assert!(err.contains("was not found on"), "{err}");
+        assert!(err.contains("command -v contextd"), "the diagnosis must be in the message: {err}");
+        assert!(err.contains("--login-shell"), "{err}");
         assert!(err.contains("--command"), "the fix must be in the message: {err}");
     }
 
@@ -729,6 +773,50 @@ mod tests {
         assert!(
             !command.contains("Ferro'; rm"),
             "the quote was not escaped, so the shell would run it: {command}"
+        );
+    }
+
+    #[test]
+    fn a_home_relative_command_path_is_expanded_not_quoted() {
+        // `'~/.local/bin/contextd'` would reach the remote shell as a literal
+        // tilde and fail — and that is the very path someone uses when
+        // contextd is not on the default PATH.
+        let transport = SshTransport::new(RemoteConfig {
+            command: "~/.local/bin/contextd".into(),
+            ..RemoteConfig::new("lab", "johnson@example")
+        })
+        .unwrap();
+        let command = transport.remote_command(&["inventory".into(), "--json".into()]);
+        assert_eq!(command, "\"$HOME\"/.local/bin/contextd inventory --json");
+    }
+
+    #[test]
+    fn a_login_shell_wraps_the_whole_command() {
+        let transport = SshTransport::new(RemoteConfig {
+            login_shell: true,
+            home: Some("/srv/state dir".into()),
+            ..RemoteConfig::new("lab", "johnson@example")
+        })
+        .unwrap();
+        let command = transport.remote_command(&["inventory".into(), "--json".into()]);
+        assert_eq!(
+            command,
+            "bash -lc 'CONTEXTD_HOME='\\''/srv/state dir'\\'' contextd inventory --json'"
+        );
+    }
+
+    #[test]
+    fn a_chatty_profile_does_not_hide_the_payload() {
+        assert_eq!(json_payload("  {\"a\":1}  "), "{\"a\":1}");
+        assert_eq!(
+            json_payload("Welcome to Ubuntu 24.04\nLast login: today\n{\"a\":1}\n"),
+            "{\"a\":1}"
+        );
+        // Nothing that looks like JSON: hand back the text so the error can
+        // quote what actually came out.
+        assert_eq!(
+            json_payload("bash: contextd: command not found"),
+            "bash: contextd: command not found"
         );
     }
 
