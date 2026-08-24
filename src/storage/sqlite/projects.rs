@@ -187,14 +187,42 @@ fn path_key(path: &Path) -> String {
     normalise(path).to_string_lossy().into_owned()
 }
 
-/// Normalise a path for comparison: resolve symlinks when possible, and strip
+/// Normalise a path for comparison: resolve symlinks where possible, and strip
 /// Windows verbatim prefixes so `\\?\C:\x` and `C:\x` compare equal.
+///
+/// Paths that do not exist are normalised too, by canonicalising the deepest
+/// ancestor that does and re-attaching the rest. Without that, a stored root
+/// canonicalised to `/private/var/...` on macOS would fail to match a query for
+/// `/var/.../subdir` that has not been created yet — the two would disagree
+/// about the same location purely because one of them could be resolved.
 fn normalise(path: &Path) -> PathBuf {
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let text = resolved.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
+    let mut trailing: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(&current) {
+            let mut out = strip_verbatim(resolved);
+            for part in trailing.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        // `..` and the root cannot be re-attached meaningfully; give up and
+        // compare the path as written.
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) if name != ".." => {
+                trailing.push(name.to_os_string());
+                current = parent.to_path_buf();
+            }
+            _ => return strip_verbatim(path.to_path_buf()),
+        }
+    }
+}
+
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    match path.to_string_lossy().strip_prefix(r"\\?\") {
         Some(stripped) => PathBuf::from(stripped),
-        None => resolved,
+        None => path,
     }
 }
 
@@ -262,6 +290,23 @@ mod tests {
         assert_eq!(found.name, "Inner");
         let found = store.find_project_by_path(&outer).unwrap().unwrap();
         assert_eq!(found.name, "Outer");
+    }
+
+    #[test]
+    fn paths_that_do_not_exist_still_match_their_project() {
+        // The query path is never created: on macOS the project root resolves
+        // through /private/var and on Windows through a verbatim prefix, so a
+        // naive comparison would miss.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_project(&project("Repo", Some(&root))).unwrap();
+
+        let deep = root.join("src").join("scheduler").join("not-created-yet");
+        let found = store.find_project_by_path(&deep).unwrap();
+        assert!(found.is_some(), "a path under the project root must resolve to it");
     }
 
     #[test]

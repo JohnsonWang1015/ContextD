@@ -23,7 +23,7 @@ jobs:
           - { os: macos-latest, target: universal2-apple-darwin }
           - { os: windows-latest, target: x64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
@@ -43,7 +43,7 @@ jobs:
     name: source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist

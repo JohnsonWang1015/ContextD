@@ -71,7 +71,7 @@ pub struct MemoryFilter {
     pub contains: Option<String>,
     /// Only memories created at or after this instant.
     pub created_from: Option<chrono::DateTime<chrono::Utc>>,
-    /// Only memories created before this instant.
+    /// Only memories created at or before this instant.
     pub created_to: Option<chrono::DateTime<chrono::Utc>>,
     pub order: MemoryOrder,
     pub limit: Option<usize>,

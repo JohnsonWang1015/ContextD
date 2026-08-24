@@ -168,12 +168,16 @@ impl<'a> SessionService<'a> {
     /// records written by the CLI while an agent's session was open.
     pub fn activity(&self, session: &Session) -> Result<SessionActivity> {
         let store = self.app.store();
-        let until = session.ended_at.unwrap_or_else(time::now);
+        // An open session has no upper bound: everything since it started is
+        // part of it, and there is nothing to record from the future. Taking
+        // "now" as the bound instead would drop whatever was written in the
+        // same millisecond as the question.
+        let until = session.ended_at;
 
         let memories = store.list_memories(&MemoryFilter {
             statuses: Status::ALL.to_vec(),
             created_from: Some(session.started_at),
-            created_to: Some(until),
+            created_to: until,
             ..MemoryFilter::for_scope(ProjectScope::Project(session.project_id.clone()))
         })?;
 
@@ -181,7 +185,8 @@ impl<'a> SessionService<'a> {
             .list_decisions(&session.project_id, true)?
             .into_iter()
             .filter(|decision| {
-                decision.created_at >= session.started_at && decision.created_at < until
+                decision.created_at >= session.started_at
+                    && until.is_none_or(|until| decision.created_at <= until)
             })
             .collect();
 
@@ -321,6 +326,41 @@ mod tests {
         assert_eq!(activity.memories.len(), 1, "only memories from inside the window");
         assert_eq!(activity.decisions.len(), 1);
         assert!(activity.headline().starts_with("claude, open for"));
+    }
+
+    #[test]
+    fn records_written_on_the_boundary_belong_to_the_session() {
+        // Timing this by hand rather than trusting the clock: on a fast
+        // machine the session, the memory and the question all land in the
+        // same millisecond, which is exactly where an exclusive bound loses
+        // the record.
+        let (_dir, app, project) = fixture();
+        let sessions = SessionService::new(&app);
+        let (session, _) = sessions.start(&project, Some("claude")).unwrap();
+
+        let opened_at = sessions.current(&project).unwrap().unwrap().started_at;
+        let memory = MemoryService::new(&app)
+            .add(NewMemory {
+                project: Some(project.clone()),
+                ..NewMemory::new(Category::Knowledge, "written at the very start")
+            })
+            .unwrap();
+        let mut memory = app.store().get_memory(&memory.id).unwrap().unwrap();
+        memory.created_at = opened_at;
+        app.store().update_memory(&memory).unwrap();
+
+        assert_eq!(
+            sessions.activity(&session).unwrap().memories.len(),
+            1,
+            "a record written as the session opened is part of it"
+        );
+
+        // The same at the closing edge.
+        let closed = sessions.end(&project, None).unwrap().unwrap();
+        let mut memory = app.store().get_memory(&memory.id).unwrap().unwrap();
+        memory.created_at = closed.ended_at.unwrap();
+        app.store().update_memory(&memory).unwrap();
+        assert_eq!(sessions.activity(&closed).unwrap().memories.len(), 1);
     }
 
     #[test]

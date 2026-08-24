@@ -351,7 +351,10 @@ fn build_where(filter: &MemoryFilter) -> (String, Vec<Box<dyn ToSql>>) {
     }
 
     if let Some(to) = &filter.created_to {
-        clauses.push("created_at < ?".to_string());
+        // Inclusive: a record written in the same millisecond as the boundary
+        // belongs to the window that was open at that instant. With `<`, a
+        // memory recorded at the very end of a session vanished from it.
+        clauses.push("created_at <= ?".to_string());
         args.push(Box::new(time::to_storage(to)));
     }
 
