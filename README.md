@@ -31,11 +31,32 @@ excluded from retrieval unless asked for.
 ## Install
 
 ```sh
-cargo install --path .          # or: cargo build --release
+uv tool install contextd        # puts `contextd` on your PATH
+contextd --version
 ```
 
-Requires Rust 1.85+. SQLite is compiled in — no system libraries, no Docker.
-Linux, macOS and Windows.
+`uv` installs the published wheel, which carries the compiled binary — no Rust
+toolchain and no Python at runtime. If `contextd` is not found afterwards, run
+`uv tool update-shell` (uv installs into `~/.local/bin`) and open a new shell.
+To try it without installing: `uvx contextd status`.
+
+From a checkout, or to run an unreleased change:
+
+```sh
+uv tool install .               # builds with your Rust toolchain
+cargo install --path .          # the same thing, straight from cargo
+```
+
+SQLite is compiled in — no system libraries, no Docker, no services to run.
+Linux, macOS and Windows. Building from source needs Rust 1.85+.
+
+Optional environment variables:
+
+| Variable | Effect |
+|---|---|
+| `CONTEXTD_HOME` | Where memory lives (default `~/.contextd`) — point it at a synced folder, or keep work and personal memory apart |
+| `NO_COLOR` | Disable colour, as does `--no-color` and `general.color = "never"` |
+| `RUST_LOG` | Log level for the CLI and MCP server; logs go to stderr, never stdout |
 
 ## Quick start
 
@@ -432,7 +453,13 @@ src/
 cargo fmt
 cargo clippy --all-targets
 cargo test              # unit + CLI + MCP + migration tests
+
+uv build --wheel        # the artefact `uv tool install contextd` ships
 ```
+
+CI runs the same three commands on Linux, macOS and Windows, and checks that
+the wheel installs and runs. Tagging `v*` builds wheels for every platform and
+publishes them to PyPI through trusted publishing.
 
 Tests run against temporary `CONTEXTD_HOME` directories and never touch your
 real memory store.

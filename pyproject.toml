@@ -1,0 +1,48 @@
+# Packaging for `uv tool install contextd`.
+#
+# ContextD is a Rust binary, but a Python wheel is the most convenient way to
+# hand a command-line tool to someone who already has uv — the same route ruff
+# and uv itself take. maturin's `bin` bindings build a wheel whose payload is
+# the compiled executable, so installing it puts `contextd` on PATH with no
+# Python involved at runtime.
+#
+#   uv tool install contextd          # from PyPI, once published
+#   uv tool install .                 # from a checkout (needs a Rust toolchain)
+#   uvx contextd status               # run once without installing
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "contextd"
+description = "Developer context and semantic memory manager for AI coding agents"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "ContextD contributors" }]
+keywords = ["ai", "memory", "mcp", "context", "cli", "claude", "codex", "cursor"]
+# Nothing here runs on Python; this is the floor uv and pip still understand.
+requires-python = ">=3.8"
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/JohnsonWang1015/ContextD"
+Repository = "https://github.com/JohnsonWang1015/ContextD"
+Issues = "https://github.com/JohnsonWang1015/ContextD/issues"
+
+[tool.maturin]
+# The crate has both a library and a binary; `bin` says which one the wheel is
+# for. Without it maturin would look for a Python extension module and fail.
+bindings = "bin"
+strip = true
