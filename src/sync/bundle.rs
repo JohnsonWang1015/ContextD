@@ -526,7 +526,11 @@ fn verdict(
 ) -> Verdict {
     match deletions.get(record) {
         None => Verdict::Alive,
-        Some(deleted_at) if updated_at > deleted_at => Verdict::Revived,
+        // A tie goes to the edit. Timestamps are stored to the millisecond, so
+        // two machines can genuinely stamp a deletion and an edit identically;
+        // when that happens, keeping the record is recoverable and losing it is
+        // not — the developer can always delete it again.
+        Some(deleted_at) if updated_at >= deleted_at => Verdict::Revived,
         Some(_) => Verdict::Dead,
     }
 }
@@ -962,6 +966,33 @@ mod tests {
         assert_eq!(report.deleted, 2);
         assert!(desktop.app.store().list_decisions(&desktop.project.id, true).unwrap().is_empty());
         assert!(desktop.app.store().list_checkpoints(&desktop.project.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_deletion_and_an_edit_in_the_same_millisecond_keep_the_record() {
+        // Constructed rather than raced: the point is what happens when two
+        // machines stamp a deletion and an edit identically, which a fast
+        // machine reaches by accident and a slow one never does.
+        let url = "git@github.com:acme/FerroGrid.git";
+        let laptop = machine("FerroGrid", Some(url));
+        let memory = add(&laptop, "Heartbeat interval is 10s");
+
+        let desktop = machine("FerroGrid", Some(url));
+        merge(&desktop.app, &build(&laptop.app, &BundleOptions::everything()).unwrap(), false)
+            .unwrap();
+
+        let local = desktop.app.store().get_memory(&memory.id).unwrap().unwrap();
+        let mut bundle = build(&laptop.app, &BundleOptions::everything()).unwrap();
+        bundle.memories.clear();
+        bundle.tombstones = vec![crate::core::model::Tombstone {
+            record: RecordRef::memory(&memory.id),
+            project_id: Some(laptop.project.id.clone()),
+            deleted_at: local.updated_at,
+        }];
+
+        let report = merge(&desktop.app, &bundle, false).unwrap();
+        assert_eq!(report.deleted, 0, "a tie must not lose the record");
+        assert_eq!(all_memories(&desktop.app).len(), 1);
     }
 
     #[test]
