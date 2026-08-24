@@ -395,6 +395,14 @@ fn explain_remote_failure(transport: &dyn RemoteTransport, err: Error) -> Error 
             transport.destination().unwrap_or("user@host")
         ));
     }
+    if text.contains("is not initialised yet") || text.contains("contextd init") {
+        return Error::Other(anyhow::anyhow!(
+            "contextd runs on {} but has no store there yet. Run `ssh {dest} contextd init` \
+             once, or point at an existing store with --remote-home.",
+            transport.describe(),
+            dest = transport.destination().unwrap_or("user@host")
+        ));
+    }
     if text.contains("command not found") || text.contains("No such file or directory") {
         return Error::Other(anyhow::anyhow!(
             "contextd was not found on {}. Check with `ssh {dest} 'command -v contextd'`:\n\
@@ -643,6 +651,30 @@ mod tests {
         assert!(err.contains("command -v contextd"), "the diagnosis must be in the message: {err}");
         assert!(err.contains("--login-shell"), "{err}");
         assert!(err.contains("--command"), "the fix must be in the message: {err}");
+    }
+
+    #[test]
+    fn a_remote_without_a_store_is_told_to_initialise_one() {
+        struct Uninitialised;
+        impl RemoteTransport for Uninitialised {
+            fn describe(&self) -> String {
+                "lab (johnson@140.123.105.18)".into()
+            }
+            fn destination(&self) -> Option<&str> {
+                Some("johnson@140.123.105.18")
+            }
+            fn run(&self, _args: &[String], _stdin: Option<&str>) -> Result<String> {
+                Err(Error::Other(anyhow::anyhow!(
+                    "remote `lab` failed (exit status: 1): ContextD is not initialised yet — \
+                     run `contextd init`"
+                )))
+            }
+        }
+
+        let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
+        let err = RemoteSync::new(&local).scan(&Uninitialised).unwrap_err().to_string();
+        assert!(err.contains("no store there yet"), "{err}");
+        assert!(err.contains("ssh johnson@140.123.105.18 contextd init"), "{err}");
     }
 
     #[test]
