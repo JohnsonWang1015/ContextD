@@ -425,3 +425,89 @@ fn starting_a_session_closes_one_left_open() {
     assert_eq!(open.len(), 1, "only one session may be open at a time");
     assert_eq!(open[0]["session"]["agent"], "codex");
 }
+
+#[test]
+fn deletions_sync_between_machines() {
+    // Three machines, so the tombstone has to travel onwards, not just once.
+    let laptop = Sandbox::new();
+    let desktop = Sandbox::new();
+    let lab = Sandbox::new();
+    for machine in [&laptop, &desktop, &lab] {
+        machine.run(&["init"]);
+        machine.run(&["attach", "--name", "FerroGrid"]);
+    }
+
+    laptop.run(&["add", "-c", "architecture", "Scheduler transport is NATS"]);
+    let temporary = laptop.run_json(&["add", "-c", "task", "Spike branch note, delete me later"])
+        ["memory"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let bundle = laptop.dir.path().join("laptop.json");
+    laptop.run(&["bundle", "export", "--out", bundle.to_str().unwrap()]);
+    desktop.run(&["bundle", "import", "--file", bundle.to_str().unwrap()]);
+    assert_eq!(desktop.run_json(&["memories"]).as_array().unwrap().len(), 2);
+
+    // Delete on the laptop and sync to the desktop.
+    laptop.run(&["delete", &temporary[..8]]);
+    laptop.run(&["bundle", "export", "--out", bundle.to_str().unwrap()]);
+    let report = desktop.run_json(&["bundle", "import", "--file", bundle.to_str().unwrap()]);
+    assert_eq!(report["deleted"], 1, "{report}");
+    assert_eq!(desktop.run_json(&["memories"]).as_array().unwrap().len(), 1);
+
+    // Syncing back must not resurrect it.
+    let back = desktop.dir.path().join("desktop.json");
+    desktop.run(&["bundle", "export", "--out", back.to_str().unwrap()]);
+    let report = laptop.run_json(&["bundle", "import", "--file", back.to_str().unwrap()]);
+    assert_eq!(report["memories_added"], 0, "a deleted memory must not come back: {report}");
+    assert_eq!(laptop.run_json(&["memories"]).as_array().unwrap().len(), 1);
+
+    // And the deletion reaches a third machine through the second.
+    lab.run(&["bundle", "import", "--file", back.to_str().unwrap()]);
+    let titles: Vec<String> = lab
+        .run_json(&["memories"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|memory| memory["title"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(titles.len(), 1, "the third machine never sees the deleted memory: {titles:?}");
+    assert!(titles[0].contains("NATS"));
+}
+
+#[test]
+fn a_memory_edited_after_a_deletion_survives() {
+    let laptop = Sandbox::new();
+    let desktop = Sandbox::new();
+    for machine in [&laptop, &desktop] {
+        machine.run(&["init"]);
+        machine.run(&["attach", "--name", "FerroGrid"]);
+    }
+
+    let id = laptop.run_json(&["add", "-c", "architecture", "Heartbeat interval is 10s"])["memory"]
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bundle = laptop.dir.path().join("laptop.json");
+    laptop.run(&["bundle", "export", "--out", bundle.to_str().unwrap()]);
+    desktop.run(&["bundle", "import", "--file", bundle.to_str().unwrap()]);
+
+    // Deleted here, edited there.
+    laptop.run(&["delete", &id[..8]]);
+    desktop.run(&["edit", &id[..8], "-m", "Heartbeat interval is 5s"]);
+
+    laptop.run(&["bundle", "export", "--out", bundle.to_str().unwrap()]);
+    let report = desktop.run_json(&["bundle", "import", "--file", bundle.to_str().unwrap()]);
+    assert_eq!(report["deleted"], 0, "the newer edit outranks the deletion: {report}");
+
+    let back = desktop.dir.path().join("desktop.json");
+    desktop.run(&["bundle", "export", "--out", back.to_str().unwrap()]);
+    let report = laptop.run_json(&["bundle", "import", "--file", back.to_str().unwrap()]);
+    assert_eq!(report["revived"], 1, "{report}");
+
+    let memories = laptop.run_json(&["memories"]);
+    assert_eq!(memories.as_array().unwrap().len(), 1);
+    assert!(memories[0]["content"].as_str().unwrap().contains("5s"));
+}

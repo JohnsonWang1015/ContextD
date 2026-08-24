@@ -503,6 +503,26 @@ pub struct AgentBinding {
     pub last_imported_at: Option<DateTime<Utc>>,
 }
 
+/// The record that a record was deleted.
+///
+/// Tombstones exist so a deletion can be synchronised: without one, the next
+/// machine to sync would helpfully hand the deleted memory back. They are
+/// written for explicit deletions only — removing a whole project is a local
+/// cleanup and does not tell every other machine to forget it too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub record: RecordRef,
+    /// Project the record belonged to, so bundles can scope tombstones.
+    pub project_id: Option<String>,
+    pub deleted_at: DateTime<Utc>,
+}
+
+impl Tombstone {
+    pub fn new(record: RecordRef, project_id: Option<String>) -> Self {
+        Self { record, project_id, deleted_at: Utc::now() }
+    }
+}
+
 /// A stored vector for one indexed record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingRecord {

@@ -272,6 +272,12 @@ async fn transfer(
         Direction::Push => sync.push(&transport, &options)?,
     };
 
+    // Records deleted elsewhere have to leave an external vector index too;
+    // the built-in one lost them with the rows themselves.
+    if !args.dry_run {
+        forget_deleted(app, &report.merge).await?;
+    }
+
     // Vectors are never shipped; what just arrived has to be embedded here.
     let embedded = if matches!(direction, Direction::Pull)
         && !args.dry_run
@@ -364,6 +370,10 @@ async fn import(app: &App, global: &GlobalArgs, args: &BundleImportArgs) -> Resu
     let bundle = Bundle::from_json(text.trim())?;
     let report = bundle::merge(app, &bundle, args.dry_run)?;
 
+    if !args.dry_run {
+        forget_deleted(app, &report).await?;
+    }
+
     let embedded = if !args.dry_run && !args.skip_embeddings && report.written() > 0 {
         IndexService::new(app).embed_pending(&ProjectScope::Any, false).await?.embedded
     } else {
@@ -377,6 +387,15 @@ async fn import(app: &App, global: &GlobalArgs, args: &BundleImportArgs) -> Resu
         return Ok(());
     }
     println!("{}", render_merge(&report, embedded));
+    Ok(())
+}
+
+/// Tell an external vector index about records a merge removed.
+async fn forget_deleted(app: &App, report: &MergeReport) -> Result<()> {
+    let indexer = IndexService::new(app);
+    for record in &report.deleted_records {
+        indexer.forget_record(record).await?;
+    }
     Ok(())
 }
 
@@ -405,6 +424,24 @@ fn render_merge(report: &MergeReport, embedded: usize) -> String {
             format!("{} new, {} updated", report.decisions_added, report.decisions_updated),
         ),
         ("Checkpoints", format!("{} new", report.checkpoints_added)),
+        (
+            "Deletions",
+            if report.deleted == 0 && report.revived == 0 {
+                ui::dim(&format!("{} recorded elsewhere", report.tombstones_received))
+            } else {
+                let mut text = format!("{} removed here", report.deleted);
+                if report.revived > 0 {
+                    // A record that was deleted somewhere and edited somewhere
+                    // else is worth calling out: it looks like a deletion that
+                    // did not take.
+                    text.push_str(&format!(
+                        ", {} came back (edited after being deleted)",
+                        report.revived
+                    ));
+                }
+                text
+            },
+        ),
         (
             "Projects",
             if report.projects_created.is_empty() {

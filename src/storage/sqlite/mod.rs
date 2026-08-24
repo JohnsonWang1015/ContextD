@@ -15,6 +15,7 @@ mod memories;
 pub mod migrations;
 mod projects;
 mod sessions;
+mod tombstones;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};

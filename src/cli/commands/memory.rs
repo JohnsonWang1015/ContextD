@@ -257,7 +257,14 @@ pub async fn delete(app: &App, global: &GlobalArgs, args: &DeleteArgs) -> Result
                 ui::hint("Archived memories stay searchable with `contextd memories --all`.")
             )
         } else {
-            ui::ok(&format!("Deleted “{}”.", memory.title))
+            format!(
+                "{}\n{}",
+                ui::ok(&format!("Deleted “{}”.", memory.title)),
+                ui::hint(
+                    "The deletion syncs to your other machines. `--archive` keeps the record \
+                     and is reversible."
+                )
+            )
         }
     })
 }

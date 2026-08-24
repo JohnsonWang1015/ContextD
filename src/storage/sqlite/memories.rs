@@ -202,6 +202,16 @@ impl MemoryRepository for SqliteStore {
     fn delete_memory(&self, id: &str) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        // The tombstone is written in the same transaction as the delete, so
+        // a record can never disappear without leaving one behind — otherwise
+        // the next sync would hand it straight back.
+        let project_id: Option<String> = tx
+            .query_row("SELECT project_id FROM memories WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        super::tombstones::insert(&tx, &RecordRef::memory(id), project_id.as_deref())?;
         super::fts::delete_record(&tx, &RecordRef::memory(id))?;
         tx.execute(
             "DELETE FROM embeddings WHERE record_kind = ?1 AND record_id = ?2",

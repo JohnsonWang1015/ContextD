@@ -163,7 +163,37 @@ comes back. Merging is by UUID, so:
 - where **both** sides changed, the local copy is kept and the divergence is
   listed rather than silently resolved;
 - supersede links travel, so history closed on one machine stays closed on the
-  other.
+  other;
+- deletions travel too, and keep travelling: a memory deleted on the laptop is
+  removed on the desktop, and reaches a third machine through either of them.
+
+### Deleting across machines
+
+`contextd delete` records a tombstone — a note that the record was deleted, and
+when — and that note syncs like any other record. Without it, the next sync
+from a machine that still had the memory would helpfully hand it back.
+
+Deletion is treated as a decision with a timestamp, so the most recent decision
+about a record stands:
+
+| Situation | Result |
+|---|---|
+| Deleted on A, untouched on B | Removed on B, and on every machine after that |
+| Deleted on A, **edited on B afterwards** | The edit wins; the record comes back and the tombstone is cleared |
+| Deleted on A and on B | Removed everywhere, once |
+
+Deleting a whole project (`contextd detach --purge`) is a local cleanup and is
+deliberately *not* synchronised: one machine tidying up should not tell the
+others to forget a project.
+
+Tombstones are kept for `sync.tombstone_retention_days` (a year by default) and
+then forgotten by `contextd refresh`. A machine that has not synced for longer
+than that can still resurrect a record it never heard was deleted — lower the
+retention only if every machine syncs often.
+
+Prefer `contextd delete --archive` when you might want the record back: it is
+reversible, it also syncs, and archived memories stay out of retrieval while
+remaining in `contextd memories --all`.
 
 Copying `contextd.db` around was rejected deliberately: two machines that both
 recorded something since the last exchange must both keep their work, and a
@@ -397,6 +427,9 @@ recency_weight = 0.25
 project_weight = 0.5
 recency_half_life_days = 90.0
 superseded_penalty = 0.35    # how far history is pushed below current truth
+
+[sync]
+tombstone_retention_days = 365   # how long deletions keep propagating
 
 [refresh]
 duplicate_threshold = 0.9    # at or above this, memories are merged

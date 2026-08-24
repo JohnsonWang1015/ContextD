@@ -252,6 +252,26 @@ pub trait AgentBindingRepository {
     fn delete_binding(&self, id: &str) -> Result<bool>;
 }
 
+/// Records of deletions, so they can be synchronised.
+pub trait TombstoneRepository {
+    /// Note that a record was deleted. Idempotent: re-recording keeps the
+    /// earliest deletion time, which is the one other machines already agreed on.
+    fn record_tombstone(&self, tombstone: &Tombstone) -> Result<()>;
+    /// Tombstones for a scope, optionally only those since an instant.
+    fn tombstones(
+        &self,
+        scope: &ProjectScope,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<Tombstone>>;
+    /// The tombstone for one record, if it has been deleted.
+    fn tombstone_for(&self, record: &RecordRef) -> Result<Option<Tombstone>>;
+    /// Forget tombstones older than an instant, returning how many went.
+    fn purge_tombstones(&self, before: chrono::DateTime<chrono::Utc>) -> Result<usize>;
+    /// Drop the tombstone for a record, used when a record legitimately
+    /// returns because it was edited elsewhere after the deletion.
+    fn clear_tombstone(&self, record: &RecordRef) -> Result<bool>;
+}
+
 /// Vector storage.
 pub trait EmbeddingRepository {
     fn upsert_embedding(&self, record: &EmbeddingRecord) -> Result<()>;
@@ -299,6 +319,7 @@ pub trait Storage:
     + DecisionRepository
     + SessionRepository
     + AgentBindingRepository
+    + TombstoneRepository
     + EmbeddingRepository
     + FullTextIndex
     + Send

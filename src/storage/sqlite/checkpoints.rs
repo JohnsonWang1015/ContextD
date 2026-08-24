@@ -119,6 +119,12 @@ impl CheckpointRepository for SqliteStore {
     fn delete_checkpoint(&self, id: &str) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let project_id: Option<String> = tx
+            .query_row("SELECT project_id FROM checkpoints WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        super::tombstones::insert(&tx, &RecordRef::checkpoint(id), project_id.as_deref())?;
         super::fts::delete_record(&tx, &RecordRef::checkpoint(id))?;
         tx.execute(
             "DELETE FROM embeddings WHERE record_kind = ?1 AND record_id = ?2",

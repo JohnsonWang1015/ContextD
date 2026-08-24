@@ -24,6 +24,11 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "init", sql: include_str!("migrations/0001_init.sql") },
     Migration { version: 2, name: "fts", sql: include_str!("migrations/0002_fts.sql") },
     Migration { version: 3, name: "sessions", sql: include_str!("migrations/0003_sessions.sql") },
+    Migration {
+        version: 4,
+        name: "tombstones",
+        sql: include_str!("migrations/0004_tombstones.sql"),
+    },
 ];
 
 /// Highest version this binary knows about.
@@ -191,6 +196,7 @@ mod tests {
             "architecture_decisions",
             "sessions",
             "agent_bindings",
+            "tombstones",
             "embeddings",
             "search_index",
         ] {

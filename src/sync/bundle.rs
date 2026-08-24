@@ -10,6 +10,12 @@
 //! exists on both sides, the newer `updated_at` wins and any genuine
 //! disagreement is reported rather than silently resolved.
 //!
+//! Deletions travel as tombstones: a record removed here becomes a note that
+//! it was removed, so the next machine to sync stops handing it back. Where a
+//! record was edited *after* it was deleted elsewhere, the edit wins and the
+//! record returns — the most recent decision about a record is the one that
+//! stands, and deleting is a decision with a timestamp like any other.
+//!
 //! Sessions do not travel either: they record who was working on which
 //! machine, not what was learned, and a checkpoint arriving from elsewhere is
 //! detached from the session it belonged to over there.
@@ -23,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::app::App;
-use crate::core::model::{Checkpoint, Decision, Memory, Project, Status};
+use crate::core::model::{
+    Checkpoint, Decision, Memory, Project, RecordKind, RecordRef, Status, Tombstone,
+};
 use crate::error::{Error, Result};
 use crate::storage::repository::{MemoryFilter, ProjectScope};
 use crate::util::time;
@@ -45,6 +53,13 @@ pub struct Bundle {
     pub memories: Vec<Memory>,
     pub decisions: Vec<Decision>,
     pub checkpoints: Vec<Checkpoint>,
+    /// Records deleted on the sending machine.
+    ///
+    /// Defaulted rather than required so a bundle written before tombstones
+    /// existed still parses; a bundle carrying them stays readable by an older
+    /// build too, which simply will not propagate the deletions.
+    #[serde(default)]
+    pub tombstones: Vec<Tombstone>,
 }
 
 /// Where a bundle came from, for the merge report.
@@ -95,9 +110,9 @@ impl Bundle {
         Ok(serde_json::to_string(self)?)
     }
 
-    /// Total records carried.
+    /// Total records carried, deletions included.
     pub fn len(&self) -> usize {
-        self.memories.len() + self.decisions.len() + self.checkpoints.len()
+        self.memories.len() + self.decisions.len() + self.checkpoints.len() + self.tombstones.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -115,11 +130,7 @@ pub fn build(app: &App, options: &BundleOptions) -> Result<Bundle> {
         .filter(|p| options.project_id.as_ref().is_none_or(|id| *id == p.id))
         .collect();
 
-    let scope = match (&options.project_id, options.include_global) {
-        (Some(id), true) => ProjectScope::ProjectWithGlobal(id.clone()),
-        (Some(id), false) => ProjectScope::Project(id.clone()),
-        (None, _) => ProjectScope::Any,
-    };
+    let scope = scope_for(options);
 
     // Every status travels: the fact that Redis was superseded is exactly the
     // kind of thing the other machine must not rediscover the hard way.
@@ -151,6 +162,14 @@ pub fn build(app: &App, options: &BundleOptions) -> Result<Bundle> {
         }
     }
 
+    let tombstones = store
+        .tombstones(&scope_for(options), options.since)?
+        .into_iter()
+        .filter(|tombstone| {
+            options.include_checkpoints || tombstone.record.kind != RecordKind::Checkpoint
+        })
+        .collect();
+
     Ok(Bundle {
         contextd_bundle: BUNDLE_VERSION,
         generated_at: time::now(),
@@ -159,7 +178,17 @@ pub fn build(app: &App, options: &BundleOptions) -> Result<Bundle> {
         memories,
         decisions,
         checkpoints,
+        tombstones,
     })
+}
+
+/// Scope implied by the bundle options.
+fn scope_for(options: &BundleOptions) -> ProjectScope {
+    match (&options.project_id, options.include_global) {
+        (Some(id), true) => ProjectScope::ProjectWithGlobal(id.clone()),
+        (Some(id), false) => ProjectScope::Project(id.clone()),
+        (None, _) => ProjectScope::Any,
+    }
 }
 
 fn changed_since(timestamp: &DateTime<Utc>, since: Option<DateTime<Utc>>) -> bool {
@@ -191,6 +220,15 @@ pub struct MergeReport {
     pub decisions_added: usize,
     pub decisions_updated: usize,
     pub checkpoints_added: usize,
+    /// Records removed here because they were deleted on the other machine.
+    pub deleted: usize,
+    /// Records that came back because they were edited after being deleted.
+    pub revived: usize,
+    /// Deletion notes stored, whether or not they removed anything here.
+    pub tombstones_received: usize,
+    /// What was removed, so an external vector index can be told.
+    #[serde(default)]
+    pub deleted_records: Vec<RecordRef>,
     /// Records where both sides changed and the local copy was kept.
     pub conflicts: Vec<Conflict>,
     pub dry_run: bool,
@@ -205,6 +243,11 @@ impl MergeReport {
             + self.decisions_added
             + self.decisions_updated
             + self.checkpoints_added
+    }
+
+    /// Whether the merge changed anything at all.
+    pub fn changed_anything(&self) -> bool {
+        self.written() > 0 || self.deleted > 0
     }
 }
 
@@ -253,6 +296,35 @@ pub fn merge(app: &App, bundle: &Bundle, dry_run: bool) -> Result<MergeReport> {
         }
     }
 
+    // What is known to be deleted, here or there. The earliest deletion wins,
+    // matching how tombstones are stored: once a machine has agreed a record
+    // is gone, a later copy of the same tombstone must not move the goalposts.
+    let mut deletions: HashMap<RecordRef, DateTime<Utc>> = HashMap::new();
+    for tombstone in &bundle.tombstones {
+        report.tombstones_received += 1;
+        deletions
+            .entry(tombstone.record.clone())
+            .and_modify(|existing| *existing = (*existing).min(tombstone.deleted_at))
+            .or_insert(tombstone.deleted_at);
+        if !dry_run {
+            store.record_tombstone(tombstone)?;
+        }
+    }
+    for record in bundle
+        .memories
+        .iter()
+        .map(|memory| RecordRef::memory(&memory.id))
+        .chain(bundle.decisions.iter().map(|decision| RecordRef::decision(&decision.id)))
+        .chain(bundle.checkpoints.iter().map(|checkpoint| RecordRef::checkpoint(&checkpoint.id)))
+    {
+        if let Some(local) = store.tombstone_for(&record)? {
+            deletions
+                .entry(record)
+                .and_modify(|existing| *existing = (*existing).min(local.deleted_at))
+                .or_insert(local.deleted_at);
+        }
+    }
+
     // Pass one: bodies, with supersede pointers withheld until every record
     // they might point at exists.
     let mut deferred_memories: Vec<Memory> = Vec::new();
@@ -263,6 +335,20 @@ pub fn merge(app: &App, bundle: &Bundle, dry_run: bool) -> Result<MergeReport> {
         incoming.project_id =
             remote.project_id.as_ref().and_then(|id| project_map.get(id).cloned());
         let pointer = incoming.superseded_by.take();
+
+        match verdict(&deletions, &RecordRef::memory(&incoming.id), &incoming.updated_at) {
+            Verdict::Dead => {
+                apply_deletion(store, &RecordRef::memory(&incoming.id), dry_run, &mut report)?;
+                continue;
+            }
+            Verdict::Revived => {
+                report.revived += 1;
+                if !dry_run {
+                    store.clear_tombstone(&RecordRef::memory(&incoming.id))?;
+                }
+            }
+            Verdict::Alive => {}
+        }
 
         match store.get_memory(&incoming.id)? {
             None => {
@@ -329,6 +415,20 @@ pub fn merge(app: &App, bundle: &Bundle, dry_run: bool) -> Result<MergeReport> {
         let supersedes = incoming.supersedes.take();
         let superseded_by = incoming.superseded_by.take();
 
+        match verdict(&deletions, &RecordRef::decision(&incoming.id), &incoming.updated_at) {
+            Verdict::Dead => {
+                apply_deletion(store, &RecordRef::decision(&incoming.id), dry_run, &mut report)?;
+                continue;
+            }
+            Verdict::Revived => {
+                report.revived += 1;
+                if !dry_run {
+                    store.clear_tombstone(&RecordRef::decision(&incoming.id))?;
+                }
+            }
+            Verdict::Alive => {}
+        }
+
         match store.get_decision(&incoming.id)? {
             None => {
                 report.decisions_added += 1;
@@ -379,6 +479,11 @@ pub fn merge(app: &App, bundle: &Bundle, dry_run: bool) -> Result<MergeReport> {
         let Some(local_project) = project_map.get(&remote.project_id) else {
             continue;
         };
+        // Checkpoints are immutable, so a tombstone always wins.
+        if deletions.contains_key(&RecordRef::checkpoint(&remote.id)) {
+            apply_deletion(store, &RecordRef::checkpoint(&remote.id), dry_run, &mut report)?;
+            continue;
+        }
         if store.get_checkpoint(&remote.id)?.is_some() {
             continue;
         }
@@ -393,7 +498,91 @@ pub fn merge(app: &App, bundle: &Bundle, dry_run: bool) -> Result<MergeReport> {
         }
     }
 
+    // Records the bundle did not carry, because the sender had already deleted
+    // them: their tombstones still have to take effect here.
+    for tombstone in &bundle.tombstones {
+        if let Verdict::Dead = verdict_for_local(store, &deletions, &tombstone.record)? {
+            apply_deletion(store, &tombstone.record, dry_run, &mut report)?;
+        }
+    }
+
     Ok(report)
+}
+
+/// What a deletion note means for one record.
+enum Verdict {
+    /// No deletion is known.
+    Alive,
+    /// Deleted, and nothing has happened since.
+    Dead,
+    /// Deleted, then edited afterwards: the edit is the newer decision.
+    Revived,
+}
+
+fn verdict(
+    deletions: &HashMap<RecordRef, DateTime<Utc>>,
+    record: &RecordRef,
+    updated_at: &DateTime<Utc>,
+) -> Verdict {
+    match deletions.get(record) {
+        None => Verdict::Alive,
+        Some(deleted_at) if updated_at > deleted_at => Verdict::Revived,
+        Some(_) => Verdict::Dead,
+    }
+}
+
+/// The same judgement for a record that exists only on this machine.
+fn verdict_for_local(
+    store: &dyn crate::storage::repository::Storage,
+    deletions: &HashMap<RecordRef, DateTime<Utc>>,
+    record: &RecordRef,
+) -> Result<Verdict> {
+    let updated_at = match record.kind {
+        RecordKind::Memory => store.get_memory(&record.id)?.map(|memory| memory.updated_at),
+        RecordKind::Decision => store.get_decision(&record.id)?.map(|d| d.updated_at),
+        RecordKind::Checkpoint => store.get_checkpoint(&record.id)?.map(|c| c.created_at),
+    };
+    Ok(match updated_at {
+        // Already gone here; nothing to do.
+        None => Verdict::Alive,
+        Some(updated_at) => verdict(deletions, record, &updated_at),
+    })
+}
+
+/// Remove a record because it was deleted elsewhere.
+///
+/// The delete path writes a tombstone of its own, stamped now. That is
+/// harmless here because the incoming tombstone was stored first and an
+/// existing one is never overwritten: this machine keeps claiming the record
+/// died when it actually died, rather than when it heard about it, which is
+/// what lets a third machine's edit from in between still win.
+fn apply_deletion(
+    store: &dyn crate::storage::repository::Storage,
+    record: &RecordRef,
+    dry_run: bool,
+    report: &mut MergeReport,
+) -> Result<bool> {
+    let existed = match record.kind {
+        RecordKind::Memory => store.get_memory(&record.id)?.is_some(),
+        RecordKind::Decision => store.get_decision(&record.id)?.is_some(),
+        RecordKind::Checkpoint => store.get_checkpoint(&record.id)?.is_some(),
+    };
+    if !existed {
+        return Ok(false);
+    }
+
+    report.deleted += 1;
+    report.deleted_records.push(record.clone());
+    if dry_run {
+        return Ok(true);
+    }
+
+    match record.kind {
+        RecordKind::Memory => store.delete_memory(&record.id)?,
+        RecordKind::Decision => store.delete_decision(&record.id)?,
+        RecordKind::Checkpoint => store.delete_checkpoint(&record.id)?,
+    };
+    Ok(true)
 }
 
 /// Which side is newer.
@@ -646,6 +835,166 @@ mod tests {
         let created = desktop.app.lookup_project("FerroGrid").unwrap();
         assert!(created.root_path.is_none(), "a remote path must not be claimed locally");
         assert_eq!(all_memories(&desktop.app).len(), 1);
+    }
+
+    #[test]
+    fn a_deletion_travels_and_does_not_come_back() {
+        let url = "git@github.com:acme/FerroGrid.git";
+        let laptop = machine("FerroGrid", Some(url));
+        let keep = add(&laptop, "Scheduler transport is NATS");
+        let drop = add(&laptop, "Temporary note about the spike branch");
+
+        let desktop = machine("FerroGrid", Some(url));
+        merge(&desktop.app, &build(&laptop.app, &BundleOptions::everything()).unwrap(), false)
+            .unwrap();
+        assert_eq!(all_memories(&desktop.app).len(), 2);
+
+        // Deleted on the laptop, then synced.
+        laptop.app.store().delete_memory(&drop.id).unwrap();
+        let bundle = build(&laptop.app, &BundleOptions::everything()).unwrap();
+        assert_eq!(bundle.tombstones.len(), 1);
+
+        let report = merge(&desktop.app, &bundle, false).unwrap();
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.tombstones_received, 1);
+        assert_eq!(report.deleted_records[0].id, drop.id);
+
+        let remaining = all_memories(&desktop.app);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, keep.id);
+
+        // Syncing the other way must not resurrect it: the desktop now knows
+        // it was deleted and says so in its own bundle.
+        let back = build(&desktop.app, &BundleOptions::everything()).unwrap();
+        assert!(back.tombstones.iter().any(|t| t.record.id == drop.id));
+        let report = merge(&laptop.app, &back, false).unwrap();
+        assert_eq!(report.memories_added, 0);
+        assert_eq!(all_memories(&laptop.app).len(), 1);
+    }
+
+    #[test]
+    fn a_deletion_propagates_through_a_third_machine() {
+        let url = "git@github.com:acme/FerroGrid.git";
+        let a = machine("FerroGrid", Some(url));
+        let note = add(&a, "Temporary note");
+        let bundle = build(&a.app, &BundleOptions::everything()).unwrap();
+
+        let b = machine("FerroGrid", Some(url));
+        let c = machine("FerroGrid", Some(url));
+        merge(&b.app, &bundle, false).unwrap();
+        merge(&c.app, &bundle, false).unwrap();
+
+        // A deletes; B hears about it; C hears about it from B.
+        a.app.store().delete_memory(&note.id).unwrap();
+        merge(&b.app, &build(&a.app, &BundleOptions::everything()).unwrap(), false).unwrap();
+        let report =
+            merge(&c.app, &build(&b.app, &BundleOptions::everything()).unwrap(), false).unwrap();
+
+        assert_eq!(report.deleted, 1, "the tombstone must travel onwards");
+        assert!(all_memories(&c.app).is_empty());
+    }
+
+    #[test]
+    fn an_edit_after_a_deletion_brings_the_record_back() {
+        let url = "git@github.com:acme/FerroGrid.git";
+        let laptop = machine("FerroGrid", Some(url));
+        let memory = add(&laptop, "Heartbeat interval is 10s");
+        let bundle = build(&laptop.app, &BundleOptions::everything()).unwrap();
+
+        let desktop = machine("FerroGrid", Some(url));
+        merge(&desktop.app, &bundle, false).unwrap();
+
+        // Deleted on the laptop; edited on the desktop afterwards.
+        laptop.app.store().delete_memory(&memory.id).unwrap();
+        let mut edited = desktop.app.store().get_memory(&memory.id).unwrap().unwrap();
+        edited.content = "Heartbeat interval is 5s".into();
+        edited.updated_at = time::now() + chrono::Duration::seconds(60);
+        desktop.app.store().update_memory(&edited).unwrap();
+
+        // The desktop keeps its edit and tells the laptop about it.
+        let report =
+            merge(&desktop.app, &build(&laptop.app, &BundleOptions::everything()).unwrap(), false)
+                .unwrap();
+        assert_eq!(report.deleted, 0, "an edit after the deletion outranks it");
+        assert_eq!(all_memories(&desktop.app).len(), 1);
+
+        let report =
+            merge(&laptop.app, &build(&desktop.app, &BundleOptions::everything()).unwrap(), false)
+                .unwrap();
+        assert_eq!(report.revived, 1);
+        assert_eq!(all_memories(&laptop.app).len(), 1);
+        assert!(laptop
+            .app
+            .store()
+            .tombstone_for(&RecordRef::memory(&memory.id))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn deleting_decisions_and_checkpoints_also_travels() {
+        use crate::core::checkpoint::{CheckpointService, NewCheckpoint};
+        use crate::core::decision::{DecisionService, NewDecision};
+
+        let url = "git@github.com:acme/FerroGrid.git";
+        let laptop = machine("FerroGrid", Some(url));
+        let decision = DecisionService::new(&laptop.app)
+            .record(&laptop.project, NewDecision::new("Transport", "Redis"))
+            .unwrap();
+        let checkpoint = CheckpointService::new(&laptop.app)
+            .create(
+                &laptop.project,
+                NewCheckpoint { summary: "spike".into(), skip_git: true, ..Default::default() },
+            )
+            .unwrap();
+
+        let desktop = machine("FerroGrid", Some(url));
+        merge(&desktop.app, &build(&laptop.app, &BundleOptions::everything()).unwrap(), false)
+            .unwrap();
+        assert_eq!(desktop.app.store().list_decisions(&desktop.project.id, true).unwrap().len(), 1);
+
+        laptop.app.store().delete_decision(&decision.id).unwrap();
+        laptop.app.store().delete_checkpoint(&checkpoint.id).unwrap();
+
+        let report =
+            merge(&desktop.app, &build(&laptop.app, &BundleOptions::everything()).unwrap(), false)
+                .unwrap();
+        assert_eq!(report.deleted, 2);
+        assert!(desktop.app.store().list_decisions(&desktop.project.id, true).unwrap().is_empty());
+        assert!(desktop.app.store().list_checkpoints(&desktop.project.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dry_run_reports_deletions_without_making_them() {
+        let url = "git@github.com:acme/FerroGrid.git";
+        let laptop = machine("FerroGrid", Some(url));
+        let memory = add(&laptop, "Temporary note");
+        let desktop = machine("FerroGrid", Some(url));
+        merge(&desktop.app, &build(&laptop.app, &BundleOptions::everything()).unwrap(), false)
+            .unwrap();
+
+        laptop.app.store().delete_memory(&memory.id).unwrap();
+        let report =
+            merge(&desktop.app, &build(&laptop.app, &BundleOptions::everything()).unwrap(), true)
+                .unwrap();
+        assert_eq!(report.deleted, 1);
+        assert_eq!(all_memories(&desktop.app).len(), 1, "nothing is removed in a dry run");
+        assert!(desktop
+            .app
+            .store()
+            .tombstone_for(&RecordRef::memory(&memory.id))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_bundle_without_tombstones_still_parses() {
+        let text = r#"{"contextd_bundle":1,"generated_at":"2026-01-01T00:00:00Z",
+                       "source":{"host":null,"version":"0.1.0"},"projects":[],"memories":[],
+                       "decisions":[],"checkpoints":[]}"#;
+        let bundle = Bundle::from_json(text).unwrap();
+        assert!(bundle.tombstones.is_empty());
+        assert!(bundle.is_empty());
     }
 
     #[test]

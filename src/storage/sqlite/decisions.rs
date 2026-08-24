@@ -170,6 +170,14 @@ impl DecisionRepository for SqliteStore {
     fn delete_decision(&self, id: &str) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let project_id: Option<String> = tx
+            .query_row(
+                "SELECT project_id FROM architecture_decisions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        super::tombstones::insert(&tx, &RecordRef::decision(id), project_id.as_deref())?;
         super::fts::delete_record(&tx, &RecordRef::decision(id))?;
         tx.execute(
             "DELETE FROM embeddings WHERE record_kind = ?1 AND record_id = ?2",

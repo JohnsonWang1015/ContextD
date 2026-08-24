@@ -24,6 +24,7 @@ use crate::error::Result;
 use crate::search::IndexService;
 use crate::storage::repository::{MemoryFilter, MemoryOrder, ProjectScope};
 use crate::util::text::jaccard;
+use crate::util::time;
 
 pub use summarizer::{Cluster, Summarizer};
 
@@ -149,6 +150,17 @@ impl<'a> RefreshService<'a> {
         if options.dry_run {
             report.notes.push("dry run: no changes were written".into());
             return Ok(report);
+        }
+
+        // Deletion records are kept long enough to reach every machine, then
+        // forgotten so they do not accumulate forever.
+        let retention = self.app.config().sync.tombstone_retention_days.max(1);
+        let cutoff = time::now() - chrono::Duration::days(retention);
+        let forgotten = self.app.store().purge_tombstones(cutoff)?;
+        if forgotten > 0 {
+            report
+                .notes
+                .push(format!("forgot {forgotten} deletion record(s) older than {retention} days"));
         }
 
         let indexer = IndexService::new(self.app);
@@ -363,6 +375,35 @@ mod tests {
             .collect();
         assert_eq!(active.len(), 1, "exactly one survivor");
         assert_eq!(active[0].id, c.id, "the newest survives");
+    }
+
+    #[tokio::test]
+    async fn expired_deletion_records_are_forgotten() {
+        use crate::core::model::{RecordRef, Tombstone};
+
+        let (_dir, app, project) = fixture();
+        app.store()
+            .record_tombstone(&Tombstone {
+                record: RecordRef::memory("ancient"),
+                project_id: Some(project.id.clone()),
+                deleted_at: time::now() - chrono::Duration::days(400),
+            })
+            .unwrap();
+        app.store()
+            .record_tombstone(&Tombstone {
+                record: RecordRef::memory("recent"),
+                project_id: Some(project.id.clone()),
+                deleted_at: time::now(),
+            })
+            .unwrap();
+
+        let report = RefreshService::new(&app)
+            .unwrap()
+            .run(Some(&project), &RefreshOptions::from_config(&app))
+            .await
+            .unwrap();
+        assert!(report.notes.iter().any(|note| note.contains("forgot 1 deletion record")));
+        assert_eq!(app.store().tombstones(&ProjectScope::Any, None).unwrap().len(), 1);
     }
 
     #[tokio::test]

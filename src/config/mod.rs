@@ -223,11 +223,24 @@ pub struct SyncConfig {
     /// Never overwrite agent files (CLAUDE.md, AGENTS.md, …) that changed
     /// outside ContextD without an explicit `--force`.
     pub protect_agent_files: bool,
+    /// How long deletion records are kept before `contextd refresh` forgets
+    /// them.
+    ///
+    /// A tombstone is what stops a deleted memory coming back on the next
+    /// sync, so it must outlive the longest gap between syncs: a machine that
+    /// has not synced since before a tombstone was forgotten will hand the
+    /// record back. A year is generous for a personal setup; lower it only if
+    /// every machine syncs often.
+    pub tombstone_retention_days: i64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self { auto_export_markdown: false, protect_agent_files: true }
+        Self {
+            auto_export_markdown: false,
+            protect_agent_files: true,
+            tombstone_retention_days: 365,
+        }
     }
 }
 
@@ -350,6 +363,13 @@ impl Config {
         if self.vector.is_external() && self.vector.collection.trim().is_empty() {
             return Err(Error::invalid("vector.collection", "must not be empty"));
         }
+        if self.sync.tombstone_retention_days < 1 {
+            return Err(Error::invalid(
+                "sync.tombstone_retention_days",
+                "must be at least 1; deletions would otherwise be forgotten immediately \
+                 and deleted memories would return on the next sync",
+            ));
+        }
         for remote in &self.remotes {
             remote.validate()?;
         }
@@ -384,6 +404,14 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.context.max_context_tokens, 100);
         assert_eq!(cfg.embeddings.provider, "local");
+    }
+
+    #[test]
+    fn tombstone_retention_must_be_positive() {
+        let mut config = Config::default();
+        assert_eq!(config.sync.tombstone_retention_days, 365);
+        config.sync.tombstone_retention_days = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
