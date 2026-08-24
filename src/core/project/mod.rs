@@ -63,7 +63,7 @@ impl<'a> ProjectService<'a> {
     /// Inspect a directory without changing anything.
     ///
     /// The project name comes from the git remote when there is one (so a
-    /// clone into `/tmp/x` is still called `FerroGrid`), otherwise from the
+    /// clone into `/tmp/x` is still called `Orbit`), otherwise from the
     /// repository root's directory name.
     pub fn detect(&self, dir: &Path, candidate_files: &[PathBuf]) -> Detection {
         let git = GitSnapshot::capture(dir);
@@ -237,7 +237,7 @@ impl<'a> ProjectService<'a> {
         Ok(())
     }
 
-    /// Derive a slug that is not taken yet (`ferrogrid`, `ferrogrid-2`, …).
+    /// Derive a slug that is not taken yet (`orbit`, `orbit-2`, …).
     fn unique_slug(&self, name: &str) -> Result<String> {
         let base = ids::slugify(name);
         let base = if base.is_empty() { "project".to_string() } else { base };
@@ -266,7 +266,7 @@ fn same_repository(a: &str, b: &str) -> bool {
     key(a) == key(b)
 }
 
-/// `git@github.com:acme/FerroGrid.git` → `FerroGrid`.
+/// `git@github.com:acme/orbit.git` → `orbit`.
 fn name_from_remote(remote: &str) -> Option<String> {
     let trimmed = remote.trim_end_matches('/').trim_end_matches(".git");
     let last = trimmed.rsplit(['/', ':']).find(|s| !s.is_empty())?;

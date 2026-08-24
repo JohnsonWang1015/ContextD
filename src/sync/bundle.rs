@@ -625,8 +625,8 @@ fn match_project<'a>(local: &'a [Project], remote: &Project) -> Option<&'a Proje
         .or_else(|| local.iter().find(|p| p.slug == remote.slug))
 }
 
-/// `git@github.com:acme/FerroGrid.git` and
-/// `https://github.com/acme/FerroGrid` name the same repository.
+/// `git@github.com:acme/orbit.git` and
+/// `https://github.com/acme/orbit` name the same repository.
 fn normalise_remote(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
     let without_scheme = trimmed.split_once("://").map(|(_, rest)| rest).unwrap_or(trimmed);

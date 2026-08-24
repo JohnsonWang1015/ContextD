@@ -63,7 +63,7 @@ Optional environment variables:
 ```sh
 contextd init                                   # create ~/.contextd
 
-cd ~/projects/FerroGrid
+cd ~/projects/orbit
 contextd attach                                 # detects git, name, agent files
 
 contextd add --category architecture \
@@ -88,7 +88,7 @@ contextd mcp serve                              # speak MCP on stdio
 ```
 ContextD
 ─────────────────────────────────
-Project      FerroGrid
+Project      Orbit
 Branch       main @ a1b2c3d (2 dirty)
 Memories     124
 Decisions    18
@@ -196,7 +196,7 @@ Last activity  2 hours ago
 Embeddings     openai · bge-m3 · vectors in qdrant
 
 project    mem  adr  ckpt  last activity  last checkpoint
-FerroGrid  80   12   5     2 hours ago    worker heartbeat completed
+Orbit      80   12   5     2 hours ago    worker heartbeat completed
 Sable      38   6    2     3 weeks ago    parser rewrite landed
 
 plus 6 global memories, applying to every project: 4 convention, 2 user
@@ -417,7 +417,7 @@ and commit your memory:
 ~/.contextd/
 ├── config.toml
 ├── contextd.db
-├── projects/FerroGrid/
+├── projects/Orbit/
 │   ├── overview.md  architecture.md  decisions.md  tasks.md
 │   └── checkpoints/
 └── global/

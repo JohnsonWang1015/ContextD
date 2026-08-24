@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! ~/.contextd/
-//! ├── projects/FerroGrid/{overview,architecture,decisions,tasks}.md
+//! ├── projects/Orbit/{overview,architecture,decisions,tasks}.md
 //! │                     └── checkpoints/2026-08-24T12-00-00Z.md
 //! └── global/{coding,git,preferences}.md
 //! ```

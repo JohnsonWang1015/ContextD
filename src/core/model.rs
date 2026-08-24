@@ -16,7 +16,7 @@ use crate::error::Error;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Project {
     pub id: String,
-    /// Display name, e.g. `FerroGrid`.
+    /// Display name, e.g. `Orbit`.
     pub name: String,
     /// Lowercase unique key used on the command line.
     pub slug: String,
