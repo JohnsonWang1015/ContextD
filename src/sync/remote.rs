@@ -18,7 +18,7 @@
 //! is quoted, so a project name with a space or a quote in it cannot become a
 //! command.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use serde::Serialize;
@@ -38,20 +38,90 @@ pub trait RemoteTransport: Send + Sync {
     /// Human-facing description, used in reports and errors.
     fn describe(&self) -> String;
 
+    /// The SSH destination, when there is one, so errors can suggest the exact
+    /// command that fixes them.
+    fn destination(&self) -> Option<&str> {
+        None
+    }
+
     /// Run `contextd <args>` on the remote machine and return its stdout.
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String>;
+}
+
+/// How `ssh` should behave when the connection needs something from a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Interaction {
+    /// Prompt when there is a terminal to prompt on, fail fast when there is
+    /// not. This is what a person at a shell wants and what cron needs.
+    #[default]
+    Auto,
+    /// Always allow prompting: passwords, host-key confirmation, 2FA.
+    Interactive,
+    /// Never prompt. A missing key becomes an immediate error rather than a
+    /// script that hangs waiting for a password nobody will type.
+    Batch,
+}
+
+impl Interaction {
+    /// Whether ssh may ask the user something.
+    fn allows_prompting(self) -> bool {
+        match self {
+            Interaction::Interactive => true,
+            Interaction::Batch => false,
+            // stdin being a terminal is the practical test for "somebody is
+            // there": a cron job, a pipeline or an MCP server has none.
+            Interaction::Auto => std::io::stdin().is_terminal(),
+        }
+    }
 }
 
 /// Transport that shells out to `ssh`.
 #[derive(Debug, Clone)]
 pub struct SshTransport {
     config: RemoteConfig,
+    interaction: Interaction,
 }
 
 impl SshTransport {
     pub fn new(config: RemoteConfig) -> Result<Self> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self { config, interaction: Interaction::default() })
+    }
+
+    /// Choose whether ssh may prompt.
+    pub fn with_interaction(mut self, interaction: Interaction) -> Self {
+        self.interaction = interaction;
+        self
+    }
+
+    /// Whether this transport will let ssh ask for a password.
+    pub fn is_interactive(&self) -> bool {
+        self.interaction.allows_prompting()
+    }
+
+    /// Arguments passed to `ssh`, before the remote command.
+    ///
+    /// Split out because this is the part worth testing: whether a password
+    /// prompt is possible comes down to one flag being present or absent.
+    pub fn ssh_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.interaction.allows_prompting() {
+            // Passwords and host-key confirmations are read straight from the
+            // terminal by ssh, so they still work while ContextD captures the
+            // command's stdout and stderr. Three attempts is ssh's default;
+            // stating it keeps a typo from turning into an endless loop.
+            args.push("-o".into());
+            args.push("NumberOfPasswordPrompts=3".into());
+        } else {
+            args.push("-o".into());
+            args.push("BatchMode=yes".into());
+        }
+        // Long enough for a sleepy laptop, short enough that an unreachable
+        // host is reported rather than waited on.
+        args.push("-o".into());
+        args.push("ConnectTimeout=15".into());
+        args.extend(self.config.ssh_options.iter().cloned());
+        args
     }
 
     /// The command string handed to the remote shell.
@@ -70,15 +140,20 @@ impl SshTransport {
 
 impl RemoteTransport for SshTransport {
     fn describe(&self) -> String {
-        format!("{} ({})", self.config.name, self.config.host)
+        if self.config.name == self.config.host {
+            self.config.host.clone()
+        } else {
+            format!("{} ({})", self.config.name, self.config.host)
+        }
+    }
+
+    fn destination(&self) -> Option<&str> {
+        Some(&self.config.host)
     }
 
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String> {
         let mut command = Command::new("ssh");
-        // Batch mode turns a missing key into an immediate error instead of an
-        // interactive password prompt that would hang a scripted sync.
-        command.arg("-o").arg("BatchMode=yes");
-        command.args(&self.config.ssh_options);
+        command.args(self.ssh_args());
         command.arg(&self.config.host);
         command.arg(self.remote_command(args));
         command
@@ -265,6 +340,23 @@ impl<'a> RemoteSync<'a> {
 /// there at all"; everything else is passed through as ssh reported it.
 fn explain_remote_failure(transport: &dyn RemoteTransport, err: Error) -> Error {
     let text = err.to_string();
+    if text.contains("Permission denied") || text.contains("Too many authentication failures") {
+        return Error::Other(anyhow::anyhow!(
+            "{} refused the login. If that account uses a password, run this from a terminal \
+             so ssh can ask for it (or pass --interactive); to stop being asked every time, \
+             `ssh-copy-id {}`.",
+            transport.describe(),
+            transport.destination().unwrap_or("user@host")
+        ));
+    }
+    if text.contains("Host key verification failed") {
+        return Error::Other(anyhow::anyhow!(
+            "{} could not be verified. Connect once with `ssh {}` to check and accept its \
+             fingerprint, then try again.",
+            transport.describe(),
+            transport.destination().unwrap_or("user@host")
+        ));
+    }
     if text.contains("command not found") || text.contains("No such file or directory") {
         return Error::Other(anyhow::anyhow!(
             "contextd is not on the PATH for {}. Install it there, or point at it with \
@@ -277,6 +369,11 @@ fn explain_remote_failure(transport: &dyn RemoteTransport, err: Error) -> Error 
 
 /// Look up a remote by name and build its transport.
 pub fn transport_for(app: &App, name: &str) -> Result<SshTransport> {
+    transport_with(app, name, Interaction::default())
+}
+
+/// Look up a remote by name, choosing how ssh may interact with the user.
+pub fn transport_with(app: &App, name: &str, interaction: Interaction) -> Result<SshTransport> {
     let config = app.config().remote(name).cloned().ok_or_else(|| {
         Error::invalid(
             "remote",
@@ -295,7 +392,7 @@ pub fn transport_for(app: &App, name: &str) -> Result<SshTransport> {
             ),
         )
     })?;
-    SshTransport::new(config)
+    Ok(SshTransport::new(config)?.with_interaction(interaction))
 }
 
 #[cfg(test)]
@@ -541,6 +638,72 @@ mod tests {
             .to_string();
         assert!(err.contains("did not return a bundle"), "{err}");
         assert!(err.contains("is contextd installed"), "{err}");
+    }
+
+    #[test]
+    fn batch_mode_is_what_decides_whether_a_password_can_be_typed() {
+        let transport = SshTransport::new(RemoteConfig::new("lab", "johnson@140.123.105.18"))
+            .unwrap()
+            .with_interaction(Interaction::Batch);
+        let args = transport.ssh_args();
+        assert!(args.iter().any(|a| a == "BatchMode=yes"), "{args:?}");
+        assert!(!transport.is_interactive());
+
+        let transport = transport.with_interaction(Interaction::Interactive);
+        let args = transport.ssh_args();
+        assert!(
+            !args.iter().any(|a| a == "BatchMode=yes"),
+            "batch mode would suppress the password prompt: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "NumberOfPasswordPrompts=3"), "{args:?}");
+        assert!(transport.is_interactive());
+    }
+
+    #[test]
+    fn ssh_options_from_configuration_are_kept() {
+        let transport = SshTransport::new(RemoteConfig {
+            ssh_options: vec!["-p".into(), "2222".into()],
+            ..RemoteConfig::new("lab", "johnson@140.123.105.18")
+        })
+        .unwrap();
+        let args = transport.ssh_args();
+        assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]), "{args:?}");
+        assert!(args.iter().any(|a| a == "ConnectTimeout=15"), "{args:?}");
+    }
+
+    #[test]
+    fn an_ad_hoc_destination_describes_itself_by_host() {
+        let transport = SshTransport::new(RemoteConfig::new(
+            "johnson@140.123.105.18",
+            "johnson@140.123.105.18",
+        ))
+        .unwrap();
+        assert_eq!(transport.describe(), "johnson@140.123.105.18");
+        assert_eq!(transport.destination(), Some("johnson@140.123.105.18"));
+    }
+
+    #[test]
+    fn a_refused_login_suggests_how_to_get_in() {
+        struct Refused;
+        impl RemoteTransport for Refused {
+            fn describe(&self) -> String {
+                "johnson@140.123.105.18".into()
+            }
+            fn destination(&self) -> Option<&str> {
+                Some("johnson@140.123.105.18")
+            }
+            fn run(&self, _args: &[String], _stdin: Option<&str>) -> Result<String> {
+                Err(Error::Other(anyhow::anyhow!(
+                    "remote failed (exit status: 255): johnson@140.123.105.18: Permission denied \
+                     (publickey,password)."
+                )))
+            }
+        }
+
+        let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
+        let err = RemoteSync::new(&local).scan(&Refused).unwrap_err().to_string();
+        assert!(err.contains("--interactive"), "{err}");
+        assert!(err.contains("ssh-copy-id johnson@140.123.105.18"), "{err}");
     }
 
     #[test]

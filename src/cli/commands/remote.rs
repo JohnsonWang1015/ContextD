@@ -21,7 +21,7 @@ use crate::search::IndexService;
 use crate::storage::repository::ProjectScope;
 use crate::sync::bundle::{self, Bundle, BundleOptions, MergeReport};
 use crate::sync::remote::{
-    transport_for, RemoteSync, SshTransport, TransferOptions, TransferReport,
+    transport_with, Interaction, RemoteSync, SshTransport, TransferOptions, TransferReport,
 };
 use crate::ui;
 
@@ -72,6 +72,32 @@ pub struct RemoveRemoteArgs {
     pub name: String,
 }
 
+/// How ssh may interact with the user, shared by every remote command.
+#[derive(Debug, Args, Clone, Copy)]
+pub struct AuthArgs {
+    /// Let ssh ask for a password, a host-key confirmation or a 2FA code.
+    ///
+    /// This is the default whenever there is a terminal to ask on; pass it
+    /// explicitly to force prompting from a script.
+    #[arg(long, conflicts_with = "batch")]
+    pub interactive: bool,
+
+    /// Never prompt: fail immediately if the connection needs a password.
+    /// Use in cron jobs, where a prompt would hang forever.
+    #[arg(long)]
+    pub batch: bool,
+}
+
+impl AuthArgs {
+    fn interaction(&self) -> Interaction {
+        match (self.interactive, self.batch) {
+            (true, _) => Interaction::Interactive,
+            (_, true) => Interaction::Batch,
+            _ => Interaction::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct ScanArgs {
     /// A configured remote, or an SSH destination such as `dev@lab-box`.
@@ -92,6 +118,9 @@ pub struct ScanArgs {
     /// Show the category breakdown for every project.
     #[arg(long)]
     pub detail: bool,
+
+    #[command(flatten)]
+    pub auth: AuthArgs,
 }
 
 #[derive(Debug, Args)]
@@ -118,6 +147,9 @@ pub struct TransferArgs {
     /// Skip the embedding pass that normally follows a pull.
     #[arg(long)]
     pub skip_embeddings: bool,
+
+    #[command(flatten)]
+    pub auth: AuthArgs,
 }
 
 /// Move memory in and out as JSON.
@@ -286,7 +318,8 @@ fn remove(app: &App, global: &GlobalArgs, args: &RemoveRemoteArgs) -> Result<()>
 fn scan(app: &App, global: &GlobalArgs, args: &ScanArgs) -> Result<()> {
     // A name that is not configured is treated as an SSH destination, so a
     // machine can be surveyed before deciding whether to keep it as a remote.
-    let (transport, known) = match transport_for(app, &args.remote) {
+    let interaction = args.auth.interaction();
+    let (transport, known) = match transport_with(app, &args.remote, interaction) {
         Ok(transport) => (transport, true),
         Err(_) if looks_like_ssh_destination(&args.remote) => (
             SshTransport::new(RemoteConfig {
@@ -295,7 +328,8 @@ fn scan(app: &App, global: &GlobalArgs, args: &ScanArgs) -> Result<()> {
                 command: args.command.clone(),
                 home: args.remote_home.clone(),
                 ssh_options: args.ssh_options.clone(),
-            })?,
+            })?
+            .with_interaction(interaction),
             false,
         ),
         Err(err) => return Err(err),
@@ -447,7 +481,7 @@ async fn transfer(
     args: &TransferArgs,
     direction: Direction,
 ) -> Result<()> {
-    let transport = transport_for(app, &args.remote)?;
+    let transport = transport_with(app, &args.remote, args.auth.interaction())?;
 
     // For a push the project must be resolved locally; for a pull the name is
     // passed through and resolved on the other machine.

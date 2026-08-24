@@ -209,6 +209,35 @@ same survey locally. The account is whichever one you SSH as, and the home is
 resolved on that machine (`$CONTEXTD_HOME`, else `~/.contextd`) — pass
 `--remote-home` if it lives somewhere else.
 
+### Machines that want a password
+
+Run it from a terminal and ssh asks, as it would on its own:
+
+```sh
+$ contextd remote scan johnson@140.123.105.18
+johnson@140.123.105.18's password:
+```
+
+Password prompts, host-key confirmations and 2FA all work because ssh reads
+them from the terminal directly. Every command decides for itself: with a
+terminal present it lets ssh prompt, and without one — cron, a pipeline, the
+MCP server — it passes `BatchMode=yes` so a missing key fails immediately
+instead of hanging on a prompt nobody will answer. Force either way with
+`--interactive` or `--batch`.
+
+Each command opens its own connection, so `scan` then `pull` asks twice. Two
+ways to stop that:
+
+```sh
+ssh-copy-id johnson@140.123.105.18          # key-based auth, asked once, ever
+
+# or reuse one authenticated connection for a few minutes
+contextd remote add lab johnson@140.123.105.18 \
+  --ssh-option=-o --ssh-option=ControlMaster=auto \
+  --ssh-option=-o --ssh-option=ControlPath=~/.ssh/cm-%r@%h:%p \
+  --ssh-option=-o --ssh-option=ControlPersist=5m
+```
+
 `pull` runs `contextd bundle export` on the far side over SSH and merges what
 comes back. Merging is by UUID, so:
 

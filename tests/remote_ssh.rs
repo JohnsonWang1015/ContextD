@@ -258,3 +258,87 @@ fn scanning_a_machine_without_contextd_explains_the_fix() {
     assert!(stderr.contains("not on the PATH"), "stderr: {stderr}");
     assert!(stderr.contains("--command"), "stderr: {stderr}");
 }
+
+/// An `ssh` that records the arguments it was handed and then fails, so the
+/// flags ContextD passes can be inspected without contacting anything.
+fn arg_recording_ssh(root: &Path, log: &Path) -> PathBuf {
+    let bin = root.join("argbin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("ssh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 255\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[test]
+fn password_prompting_is_allowed_unless_batch_is_asked_for() {
+    let sandbox = Sandbox::new();
+    sandbox.bootstrap();
+    let log = sandbox.dir.path().join("ssh-args.txt");
+    let bin = arg_recording_ssh(sandbox.dir.path(), &log);
+
+    let run = |args: &[&str]| -> Vec<String> {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let _ = sandbox
+            .cmd()
+            .env("PATH", format!("{}:{existing}", bin.display()))
+            .args(args)
+            .output()
+            .expect("spawn contextd");
+        std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect()
+    };
+
+    // Asking for interaction must not disable ssh's password prompt.
+    let args = run(&["remote", "scan", "johnson@140.123.105.18", "--interactive"]);
+    assert!(
+        !args.iter().any(|arg| arg == "BatchMode=yes"),
+        "BatchMode would suppress the password prompt: {args:?}"
+    );
+    assert!(args.iter().any(|arg| arg == "NumberOfPasswordPrompts=3"), "{args:?}");
+    assert!(args.iter().any(|arg| arg == "johnson@140.123.105.18"), "{args:?}");
+    assert!(
+        args.last().is_some_and(|last| last.contains("contextd inventory --json")),
+        "the remote command is the final argument: {args:?}"
+    );
+
+    // A scripted run must fail rather than wait for a password nobody types.
+    let args = run(&["remote", "scan", "johnson@140.123.105.18", "--batch"]);
+    assert!(args.iter().any(|arg| arg == "BatchMode=yes"), "{args:?}");
+
+    // The same choice applies to pull and push.
+    let args = run(&["remote", "pull", "johnson@140.123.105.18", "--batch"]);
+    assert!(args.is_empty() || args.iter().any(|arg| arg == "BatchMode=yes"), "{args:?}");
+}
+
+#[test]
+fn a_refused_password_login_explains_the_next_step() {
+    let sandbox = Sandbox::new();
+    sandbox.bootstrap();
+
+    let bin = sandbox.dir.path().join("denybin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("ssh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'johnson@140.123.105.18: Permission denied (publickey,password).' >&2\nexit 255\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    let output = sandbox
+        .cmd()
+        .env("PATH", format!("{}:{existing}", bin.display()))
+        .args(["remote", "scan", "johnson@140.123.105.18"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refused the login"), "stderr: {stderr}");
+    assert!(stderr.contains("ssh-copy-id johnson@140.123.105.18"), "stderr: {stderr}");
+}
