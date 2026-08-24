@@ -10,3 +10,4 @@ pub mod memory;
 pub mod model;
 pub mod project;
 pub mod refresh;
+pub mod session;

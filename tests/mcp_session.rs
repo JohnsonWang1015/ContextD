@@ -208,3 +208,50 @@ fn read_only_servers_refuse_writes() {
     assert_eq!(refused["result"]["isError"], true);
     assert!(sandbox.run_json(&["memories"]).as_array().unwrap().is_empty());
 }
+
+#[test]
+fn an_mcp_connection_is_recorded_as_a_working_session() {
+    let sandbox = Sandbox::new();
+    sandbox.bootstrap();
+
+    {
+        let mut session = Session::start(&sandbox, &[]);
+        session.request(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "clientInfo": {"name": "Claude Code"}}),
+        );
+        session.notify("notifications/initialized");
+
+        // While connected, the CLI sees the open session.
+        let status = sandbox.run_json(&["status"]);
+        assert_eq!(status["session"]["session"]["agent"], "claude code");
+        assert!(status["session"]["session"]["ended_at"].is_null());
+
+        session.call_tool(2, "checkpoint_create", json!({"summary": "worker heartbeat completed"}));
+        session.call_tool(3, "session_summarize", json!({"summary": "wired up the heartbeat"}));
+
+        let history = session.call_tool(4, "session_history", json!({}));
+        assert!(text_of(&history).contains("claude code"));
+    }
+    // Dropping the session kills the child, which is what a client crashing
+    // looks like; the next connection closes the session it left behind.
+    {
+        let mut session = Session::start(&sandbox, &[]);
+        session.request(1, "initialize", json!({"clientInfo": {"name": "codex"}}));
+
+        let sessions = sandbox.run_json(&["session", "list"]);
+        let claude = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|activity| activity["session"]["agent"] == "claude code")
+            .expect("the earlier session is recorded");
+        assert!(
+            !claude["session"]["ended_at"].is_null(),
+            "a session left open by a crash is closed by the next one"
+        );
+        assert_eq!(claude["session"]["summary"], "wired up the heartbeat");
+        assert_eq!(claude["checkpoints"].as_array().unwrap().len(), 1);
+    }
+}

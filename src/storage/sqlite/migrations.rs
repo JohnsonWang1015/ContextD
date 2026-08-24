@@ -23,6 +23,7 @@ pub struct Migration {
 pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "init", sql: include_str!("migrations/0001_init.sql") },
     Migration { version: 2, name: "fts", sql: include_str!("migrations/0002_fts.sql") },
+    Migration { version: 3, name: "sessions", sql: include_str!("migrations/0003_sessions.sql") },
 ];
 
 /// Highest version this binary knows about.
@@ -134,7 +135,7 @@ mod tests {
     fn migrate_applies_all_then_is_idempotent() {
         let mut conn = mem();
         let applied = migrate(&mut conn).unwrap();
-        assert_eq!(applied, vec![1, 2]);
+        assert_eq!(applied, (1..=target_version()).collect::<Vec<_>>());
         assert_eq!(current_version(&conn).unwrap(), target_version());
 
         let again = migrate(&mut conn).unwrap();

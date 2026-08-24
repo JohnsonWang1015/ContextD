@@ -46,6 +46,8 @@ pub struct StatusReport {
     pub embedding_provider: String,
     /// Backend the vectors are searched in, and whether it answers.
     pub vector: crate::search::vector::VectorHealth,
+    /// The session in progress, or the last one that ran.
+    pub session: Option<crate::core::session::SessionActivity>,
 }
 
 /// Project operations.
@@ -192,6 +194,17 @@ impl<'a> ProjectService<'a> {
 
         let vector = crate::search::IndexService::new(self.app).vector_health().await?;
 
+        let session = match project {
+            Some(project) => {
+                let sessions = crate::core::session::SessionService::new(self.app);
+                match sessions.current(project)?.or(sessions.latest(project)?) {
+                    Some(session) => Some(sessions.activity(&session)?),
+                    None => None,
+                }
+            }
+            None => None,
+        };
+
         Ok(StatusReport {
             project: project.cloned(),
             stats,
@@ -204,6 +217,7 @@ impl<'a> ProjectService<'a> {
             embedded,
             embedding_provider: provider,
             vector,
+            session,
         })
     }
 

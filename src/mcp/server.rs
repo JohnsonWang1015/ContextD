@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::app::App;
+use crate::core::model::Session;
+use crate::core::session::SessionService;
 use crate::error::Result;
 use crate::mcp::protocol::{negotiate_version, Request, Response, RpcError, ToolResult};
 use crate::mcp::tools;
@@ -26,11 +28,65 @@ pub struct McpServer {
     app: App,
     options: ServerOptions,
     initialized: bool,
+    /// The working session opened for this connection, if a project is in play.
+    session: Option<Session>,
 }
 
 impl McpServer {
     pub fn new(app: App, options: ServerOptions) -> Self {
-        Self { app, options, initialized: false }
+        Self { app, options, initialized: false, session: None }
+    }
+
+    /// The session this connection opened, if any.
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+
+    /// Open a working session for the connecting agent.
+    ///
+    /// The client tells us its name during `initialize`, which is the only
+    /// point at which ContextD can know *which* agent is about to work. A
+    /// read-only server records nothing.
+    fn open_session(&mut self, client: &str) {
+        if self.options.read_only {
+            return;
+        }
+        let project = match self.app.resolve_project(self.options.default_project.as_deref()) {
+            Ok(Some(project)) => project,
+            // No project here: there is nothing to attribute the work to, and
+            // failing initialize over it would be absurd.
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot resolve a project for this session");
+                return;
+            }
+        };
+        match SessionService::new(&self.app).start(&project, Some(client)) {
+            Ok((session, closed)) => {
+                if let Some(previous) = closed {
+                    tracing::info!(
+                        session = %previous.id,
+                        "closed a session left open by a previous connection"
+                    );
+                }
+                self.session = Some(session);
+            }
+            Err(err) => tracing::warn!(error = %err, "could not start a session"),
+        }
+    }
+
+    /// Close the session when the connection goes away.
+    ///
+    /// Summarising is left to the agent (via `checkpoint_create`): inventing a
+    /// summary here would put words in its mouth. A session left open by a
+    /// crash is closed by the next one that starts.
+    fn close_session(&mut self) {
+        let Some(session) = self.session.take() else { return };
+        if let Err(err) = self.app.store().end_session(&session.id, None) {
+            tracing::warn!(error = %err, "could not close the session");
+        } else {
+            tracing::info!(session = %session.id, "session closed");
+        }
     }
 
     /// Serve until stdin closes.
@@ -51,6 +107,7 @@ impl McpServer {
             let read = reader.read_line(&mut line).await?;
             if read == 0 {
                 tracing::info!("stdin closed, shutting down");
+                self.close_session();
                 return Ok(());
             }
             let trimmed = line.trim();
@@ -127,6 +184,7 @@ impl McpServer {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         tracing::info!(client, "initialize");
+        self.open_session(client);
 
         json!({
             "protocolVersion": negotiate_version(requested),
@@ -374,6 +432,85 @@ mod tests {
 
         let unknown = tool(&mut server, "no_such_tool", json!({})).await;
         assert_eq!(unknown["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn a_connection_opens_and_closes_a_working_session() {
+        use crate::core::session::SessionService;
+
+        let (_dir, app, project) = fixture();
+        let mut server = server(&app, false);
+        assert!(server.session().is_none(), "no session before initialize");
+
+        call(
+            &mut server,
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "clientInfo": {"name": "Claude Code"}}),
+        )
+        .await;
+
+        let sessions = SessionService::new(&app);
+        let open = sessions.current(&project).unwrap().expect("a session is open");
+        assert_eq!(open.agent.as_deref(), Some("claude code"));
+        assert_eq!(server.session().unwrap().id, open.id);
+
+        // Work done through the connection belongs to the session.
+        tool(&mut server, "checkpoint_create", json!({"summary": "worker heartbeat completed"}))
+            .await;
+        tool(&mut server, "session_summarize", json!({"summary": "wired up heartbeat"})).await;
+        let activity = sessions.activity(&open).unwrap();
+        assert_eq!(activity.checkpoints.len(), 1);
+        assert!(activity.is_open(), "summarising must not close the session");
+
+        // Losing stdin ends it.
+        server.close_session();
+        let closed = app.store().get_session(&open.id).unwrap().unwrap();
+        assert!(closed.ended_at.is_some());
+        assert_eq!(closed.summary.as_deref(), Some("wired up heartbeat"));
+        assert!(sessions.current(&project).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_history_tells_the_next_agent_what_happened() {
+        use crate::core::session::SessionService;
+
+        let (_dir, app, project) = fixture();
+        let sessions = SessionService::new(&app);
+        sessions.start(&project, Some("codex")).unwrap();
+        crate::core::checkpoint::CheckpointService::new(&app)
+            .create(
+                &project,
+                crate::core::checkpoint::NewCheckpoint {
+                    summary: "coordinator finished".into(),
+                    skip_git: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sessions.end(&project, Some("built the coordinator")).unwrap();
+
+        let mut server = server(&app, false);
+        let response = tool(&mut server, "session_history", json!({})).await;
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("codex"), "{text}");
+        assert!(text.contains("built the coordinator"), "{text}");
+        assert!(text.contains("checkpoint: coordinator finished"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_server_records_no_session() {
+        use crate::core::session::SessionService;
+
+        let (_dir, app, project) = fixture();
+        let mut server = server(&app, true);
+        call(&mut server, 1, "initialize", json!({"clientInfo": {"name": "claude"}})).await;
+
+        assert!(server.session().is_none());
+        assert!(SessionService::new(&app).current(&project).unwrap().is_none());
+
+        let refused = tool(&mut server, "session_summarize", json!({"summary": "x"})).await;
+        assert_eq!(refused["result"]["isError"], true);
     }
 
     #[tokio::test]

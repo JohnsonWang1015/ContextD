@@ -312,6 +312,16 @@ fn build_where(filter: &MemoryFilter) -> (String, Vec<Box<dyn ToSql>>) {
         }
     }
 
+    if let Some(from) = &filter.created_from {
+        clauses.push("created_at >= ?".to_string());
+        args.push(Box::new(time::to_storage(from)));
+    }
+
+    if let Some(to) = &filter.created_to {
+        clauses.push("created_at < ?".to_string());
+        args.push(Box::new(time::to_storage(to)));
+    }
+
     if let Some(needle) = &filter.contains {
         clauses.push(r"(title LIKE ? ESCAPE '\' OR content LIKE ? ESCAPE '\')".to_string());
         let pattern = format!("%{}%", escape_like(needle));
@@ -509,6 +519,30 @@ mod tests {
         let no_match =
             MemoryFilter { contains: Some("%%%".into()), ..MemoryFilter::for_scope(scope) };
         assert!(store.list_memories(&no_match).unwrap().is_empty());
+    }
+
+    #[test]
+    fn filters_by_creation_window() {
+        let (store, project) = store_with_project();
+        let mut old = memory(&project, "Old", "older memory");
+        old.created_at = time::now() - chrono::Duration::hours(3);
+        store.create_memory(&old).unwrap();
+        store.create_memory(&memory(&project, "New", "newer memory")).unwrap();
+
+        let since = MemoryFilter {
+            created_from: Some(time::now() - chrono::Duration::hours(1)),
+            ..MemoryFilter::for_scope(ProjectScope::Any)
+        };
+        let recent = store.list_memories(&since).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].title, "New");
+
+        let window = MemoryFilter {
+            created_from: Some(time::now() - chrono::Duration::hours(4)),
+            created_to: Some(time::now() - chrono::Duration::hours(2)),
+            ..MemoryFilter::for_scope(ProjectScope::Any)
+        };
+        assert_eq!(store.list_memories(&window).unwrap().len(), 1);
     }
 
     #[test]

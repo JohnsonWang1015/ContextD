@@ -70,6 +70,9 @@ impl<'a> CheckpointService<'a> {
         checkpoint.git_branch = git.branch.clone();
         checkpoint.git_commit = git.commit.clone();
         checkpoint.dirty_files = git.dirty_files.clone();
+        // A checkpoint made while an agent is connected belongs to that
+        // session; one made from a plain terminal belongs to no session.
+        checkpoint.session_id = store.open_session(&project.id)?.map(|session| session.id);
 
         store.create_checkpoint(&checkpoint)?;
         Ok(checkpoint)

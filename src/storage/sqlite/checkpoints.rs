@@ -11,7 +11,7 @@ use super::{from_json_list, to_json_list, SqliteStore};
 
 const COLUMNS: &str = "id, project_id, summary, current_goal, completed, current_state, \
                        next_steps, open_problems, related_files, git_branch, git_commit, \
-                       dirty_files, created_at";
+                       dirty_files, created_at, session_id";
 
 fn map_checkpoint(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     Ok(Checkpoint {
@@ -28,6 +28,7 @@ fn map_checkpoint(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
         git_commit: row.get(10)?,
         dirty_files: from_json_list(&row.get::<_, String>(11)?),
         created_at: time::from_storage(&row.get::<_, String>(12)?),
+        session_id: row.get(13)?,
     })
 }
 
@@ -41,8 +42,8 @@ impl CheckpointRepository for SqliteStore {
         tx.execute(
             "INSERT INTO checkpoints (id, project_id, summary, current_goal, completed,
                                       current_state, next_steps, open_problems, related_files,
-                                      git_branch, git_commit, dirty_files, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                      git_branch, git_commit, dirty_files, created_at, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 checkpoint.id,
                 checkpoint.project_id,
@@ -57,6 +58,7 @@ impl CheckpointRepository for SqliteStore {
                 checkpoint.git_commit,
                 to_json_list(&checkpoint.dirty_files),
                 time::to_storage(&checkpoint.created_at),
+                checkpoint.session_id,
             ],
         )?;
         super::fts::index_record(
@@ -91,6 +93,19 @@ impl CheckpointRepository for SqliteStore {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![project_id, limit as i64], map_checkpoint)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn checkpoints_for_session(&self, session_id: &str) -> Result<Vec<Checkpoint>> {
+        let conn = self.conn();
+        let sql = format!(
+            "SELECT {COLUMNS} FROM checkpoints WHERE session_id = ?1
+              ORDER BY created_at ASC, rowid ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![session_id], map_checkpoint)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

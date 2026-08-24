@@ -148,6 +148,15 @@ fn is_wide(ch: char) -> bool {
         | 0x1F300..=0x1FAFF)
 }
 
+/// `1 memory`, `3 memories` — count plus a correctly pluralised noun.
+pub fn plural(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
 /// `✓` when true, `–` when false.
 pub fn check(ok: bool) -> String {
     if ok {
@@ -218,6 +227,13 @@ mod tests {
     #[test]
     fn empty_table_is_empty() {
         assert_eq!(table(&["a"], &[]), "");
+    }
+
+    #[test]
+    fn plurals_read_correctly() {
+        assert_eq!(plural(1, "checkpoint", "checkpoints"), "1 checkpoint");
+        assert_eq!(plural(0, "checkpoint", "checkpoints"), "0 checkpoints");
+        assert_eq!(plural(3, "memory", "memories"), "3 memories");
     }
 
     #[test]

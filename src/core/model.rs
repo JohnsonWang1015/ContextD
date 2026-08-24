@@ -338,6 +338,8 @@ pub const DEFAULT_PRIORITY: i64 = 3;
 pub struct Checkpoint {
     pub id: String,
     pub project_id: String,
+    /// Working session this checkpoint was made in, when one was open.
+    pub session_id: Option<String>,
     /// One-line summary, e.g. "worker heartbeat completed".
     pub summary: String,
     pub current_goal: Option<String>,
@@ -357,6 +359,7 @@ impl Checkpoint {
         Checkpoint {
             id: crate::util::ids::new_id(),
             project_id: project_id.into(),
+            session_id: None,
             summary: summary.into(),
             current_goal: None,
             completed: Vec::new(),

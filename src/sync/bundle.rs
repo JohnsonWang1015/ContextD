@@ -10,6 +10,10 @@
 //! exists on both sides, the newer `updated_at` wins and any genuine
 //! disagreement is reported rather than silently resolved.
 //!
+//! Sessions do not travel either: they record who was working on which
+//! machine, not what was learned, and a checkpoint arriving from elsewhere is
+//! detached from the session it belonged to over there.
+//!
 //! Embeddings are not transferred. They are derived data, they may come from a
 //! different provider on the other machine, and `contextd refresh` recreates
 //! them locally in less time than shipping them would take.
@@ -382,6 +386,9 @@ pub fn merge(app: &App, bundle: &Bundle, dry_run: bool) -> Result<MergeReport> {
         if !dry_run {
             let mut incoming = remote.clone();
             incoming.project_id = local_project.clone();
+            // Sessions describe activity on the machine they happened on and
+            // do not travel, so a session id from over there would dangle.
+            incoming.session_id = None;
             store.create_checkpoint(&incoming)?;
         }
     }
@@ -639,6 +646,39 @@ mod tests {
         let created = desktop.app.lookup_project("FerroGrid").unwrap();
         assert!(created.root_path.is_none(), "a remote path must not be claimed locally");
         assert_eq!(all_memories(&desktop.app).len(), 1);
+    }
+
+    #[test]
+    fn checkpoints_arrive_detached_from_their_session() {
+        use crate::core::session::SessionService;
+
+        let laptop = machine("FerroGrid", Some("git@github.com:acme/FerroGrid.git"));
+        SessionService::new(&laptop.app).start(&laptop.project, Some("claude")).unwrap();
+        crate::core::checkpoint::CheckpointService::new(&laptop.app)
+            .create(
+                &laptop.project,
+                crate::core::checkpoint::NewCheckpoint {
+                    summary: "heartbeat done".into(),
+                    skip_git: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let bundle = build(&laptop.app, &BundleOptions::everything()).unwrap();
+        assert!(bundle.checkpoints[0].session_id.is_some(), "it is linked on the source machine");
+
+        let desktop = machine("FerroGrid", Some("git@github.com:acme/FerroGrid.git"));
+        merge(&desktop.app, &bundle, false).unwrap();
+
+        let arrived = desktop
+            .app
+            .store()
+            .list_checkpoints(&desktop.project.id, 10)
+            .unwrap()
+            .pop()
+            .expect("checkpoint travelled");
+        assert_eq!(arrived.summary, "heartbeat done");
+        assert!(arrived.session_id.is_none(), "the session id must not dangle");
     }
 
     #[test]

@@ -133,6 +133,10 @@ pub enum Command {
     /// Print context for picking the work back up.
     Resume(commands::checkpoint::ResumeArgs),
 
+    /// Working sessions: who worked on this project, when, and what came of it.
+    #[command(subcommand)]
+    Session(commands::session::SessionCommand),
+
     /// Architecture decision records.
     #[command(subcommand)]
     Decision(commands::decision::DecisionCommand),
@@ -218,6 +222,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Recall(args) => commands::search::recall(&app, global, &args).await,
         Command::Checkpoint(args) => commands::checkpoint::checkpoint(&app, global, &args).await,
         Command::Resume(args) => commands::checkpoint::resume(&app, global, &args).await,
+        Command::Session(command) => commands::session::run(&app, global, command),
         Command::Decision(command) => commands::decision::run(&app, global, command),
         Command::Refresh(args) => commands::maintenance::refresh(&app, global, &args).await,
         Command::Sync(args) => commands::maintenance::sync(&app, global, &args).await,

@@ -69,6 +69,10 @@ pub struct MemoryFilter {
     pub tags: Vec<String>,
     /// Substring match on title/content, used by `list --grep`.
     pub contains: Option<String>,
+    /// Only memories created at or after this instant.
+    pub created_from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only memories created before this instant.
+    pub created_to: Option<chrono::DateTime<chrono::Utc>>,
     pub order: MemoryOrder,
     pub limit: Option<usize>,
     pub offset: usize,
@@ -202,6 +206,9 @@ pub trait CheckpointRepository {
     fn create_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()>;
     fn latest_checkpoint(&self, project_id: &str) -> Result<Option<Checkpoint>>;
     fn list_checkpoints(&self, project_id: &str, limit: usize) -> Result<Vec<Checkpoint>>;
+    /// Checkpoints recorded during one session, oldest first — the order the
+    /// work actually happened in.
+    fn checkpoints_for_session(&self, session_id: &str) -> Result<Vec<Checkpoint>>;
     fn get_checkpoint(&self, id: &str) -> Result<Option<Checkpoint>>;
     fn delete_checkpoint(&self, id: &str) -> Result<bool>;
 }
@@ -222,7 +229,13 @@ pub trait DecisionRepository {
 pub trait SessionRepository {
     fn start_session(&self, session: &Session) -> Result<()>;
     fn end_session(&self, id: &str, summary: Option<&str>) -> Result<bool>;
+    /// Record what a session achieved without closing it.
+    fn summarize_session(&self, id: &str, summary: &str) -> Result<bool>;
+    /// Most recent session, open or closed.
     fn latest_session(&self, project_id: &str) -> Result<Option<Session>>;
+    /// The session still running for this project, if any.
+    fn open_session(&self, project_id: &str) -> Result<Option<Session>>;
+    fn get_session(&self, id: &str) -> Result<Option<Session>>;
     fn list_sessions(&self, project_id: &str, limit: usize) -> Result<Vec<Session>>;
 }
 

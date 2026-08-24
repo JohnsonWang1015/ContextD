@@ -161,8 +161,34 @@ pub async fn resume(app: &App, global: &GlobalArgs, args: &ResumeArgs) -> Result
         memories: bundle.memories.len(),
     };
 
+    // A finished session is the closest thing to "what happened last time",
+    // so it belongs in the handover the next agent reads.
+    let previous_session = match &project {
+        Some(project) => {
+            let sessions = crate::core::session::SessionService::new(app);
+            sessions
+                .latest(project)?
+                .filter(|session| session.ended_at.is_some())
+                .map(|session| sessions.activity(&session))
+                .transpose()?
+        }
+        None => None,
+    };
+
     output::render(global, &payload, || {
         let mut out = text.clone();
+        if let Some(activity) = &previous_session {
+            out.push_str(&format!(
+                "\nLast session: {}{}\n",
+                activity.headline(),
+                activity
+                    .session
+                    .summary
+                    .as_ref()
+                    .map(|summary| format!(" — {summary}"))
+                    .unwrap_or_default()
+            ));
+        }
         if bundle.budget.dropped > 0 {
             out.push_str(&format!(
                 "\n{}\n",

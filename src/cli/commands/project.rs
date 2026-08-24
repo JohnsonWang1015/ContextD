@@ -314,6 +314,7 @@ pub async fn status(app: &App, global: &GlobalArgs, _args: &StatusArgs) -> Resul
         embedding_provider: String,
         vector: crate::search::vector::VectorHealth,
         latest_checkpoint: Option<crate::core::model::Checkpoint>,
+        session: Option<crate::core::session::SessionActivity>,
         agents: Vec<String>,
     }
 
@@ -327,6 +328,7 @@ pub async fn status(app: &App, global: &GlobalArgs, _args: &StatusArgs) -> Resul
         embedding_provider: report.embedding_provider.clone(),
         vector: report.vector.clone(),
         latest_checkpoint: report.latest_checkpoint.clone(),
+        session: report.session.clone(),
         agents: report.bindings.iter().map(|b| b.agent.clone()).collect(),
     };
 
@@ -353,6 +355,24 @@ fn render_status(report: &StatusReport) -> String {
         }
         rows.push(("Branch", value));
     }
+    if let Some(activity) = &report.session {
+        // An open session is live state and belongs at the top; a finished one
+        // is history and reads better next to the checkpoint below.
+        if activity.is_open() {
+            rows.push((
+                "Session",
+                format!(
+                    "{} {}",
+                    ui::green(&activity.headline()),
+                    ui::dim(&format!(
+                        "{}, {}",
+                        ui::plural(activity.checkpoints.len(), "checkpoint", "checkpoints"),
+                        ui::plural(activity.memories.len(), "memory", "memories")
+                    ))
+                ),
+            ));
+        }
+    }
     rows.push(("Memories", report.stats.active_memories.to_string()));
     if report.stats.superseded_memories > 0 {
         rows.push(("History", format!("{} superseded", report.stats.superseded_memories)));
@@ -361,6 +381,20 @@ fn render_status(report: &StatusReport) -> String {
     rows.push(("Checkpoints", report.stats.checkpoints.to_string()));
     text.push_str(&ui::kv(&rows));
     text.push_str("\n\n");
+
+    if let Some(activity) = report.session.as_ref().filter(|activity| !activity.is_open()) {
+        text.push_str(&format!(
+            "{}\n{}{}\n\n",
+            ui::dim("Last session"),
+            activity.headline(),
+            activity
+                .session
+                .summary
+                .as_ref()
+                .map(|summary| format!(" — {summary}"))
+                .unwrap_or_default()
+        ));
+    }
 
     match &report.latest_checkpoint {
         Some(checkpoint) => {

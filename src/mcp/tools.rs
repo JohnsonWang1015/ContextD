@@ -14,6 +14,7 @@ use crate::core::decision::DecisionService;
 use crate::core::memory::{MemoryService, NewMemory};
 use crate::core::model::{Category, Project, RecordKind, Source};
 use crate::core::project::ProjectService;
+use crate::core::session::SessionService;
 use crate::error::Result;
 use crate::mcp::protocol::{ToolResult, ToolSpec};
 use crate::search::{SearchMode, SearchRequest, SearchService};
@@ -97,6 +98,19 @@ pub fn specs(read_only: bool) -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "session_history",
+            description: "Recent working sessions on this project: which agent worked, for how \
+                          long, what it recorded and how it summarised the work. Use at the \
+                          start of a session to find out what happened last time.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
+                }
+            }),
+        },
+        ToolSpec {
             name: "architecture_decisions",
             description: "Architecture decision records. Returns the decisions that currently \
                           hold; superseded ones only when asked for.",
@@ -132,6 +146,20 @@ pub fn specs(read_only: bool) -> Vec<ToolSpec> {
             }),
         });
         specs.push(ToolSpec {
+            name: "session_summarize",
+            description: "Record what this working session has achieved. The session stays open \
+                          and closes when the connection does; call this before you finish so \
+                          the next agent sees what you did.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "project": {"type": "string"}
+                },
+                "required": ["summary"]
+            }),
+        });
+        specs.push(ToolSpec {
             name: "checkpoint_create",
             description: "Save where the work stands, so the next session can resume it.",
             input_schema: json!({
@@ -159,7 +187,7 @@ pub async fn call(
     name: &str,
     arguments: &Value,
 ) -> Result<ToolResult> {
-    if read_only && matches!(name, "memory_add" | "checkpoint_create") {
+    if read_only && matches!(name, "memory_add" | "checkpoint_create" | "session_summarize") {
         return Ok(ToolResult::error(format!(
             "`{name}` is unavailable: this ContextD server is running read-only"
         )));
@@ -173,6 +201,8 @@ pub async fn call(
         "project_status" => project_status(app, default_project, arguments).await,
         "checkpoint_latest" => checkpoint_latest(app, default_project, arguments),
         "architecture_decisions" => architecture_decisions(app, default_project, arguments),
+        "session_history" => session_history(app, default_project, arguments),
+        "session_summarize" => session_summarize(app, default_project, arguments),
         "memory_add" => memory_add(app, default_project, arguments).await,
         "checkpoint_create" => checkpoint_create(app, default_project, arguments),
         other => Ok(ToolResult::error(format!("unknown tool `{other}`"))),
@@ -293,8 +323,25 @@ async fn project_status(
     let project = resolve_project(app, default_project, args)?;
     let report = ProjectService::new(app).status(project.as_ref()).await?;
     let name = report.project.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "—".into());
+    let session_line = report
+        .session
+        .as_ref()
+        .map(|activity| {
+            format!(
+                "\nsession: {}{}",
+                activity.headline(),
+                activity
+                    .session
+                    .summary
+                    .as_ref()
+                    .map(|summary| format!(" — {summary}"))
+                    .unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+
     let text = format!(
-        "{name}: {} memories ({} superseded), {} decisions, {} checkpoints\nbranch: {}\nlast checkpoint: {}",
+        "{name}: {} memories ({} superseded), {} decisions, {} checkpoints\nbranch: {}\nlast checkpoint: {}{session_line}",
         report.stats.active_memories,
         report.stats.superseded_memories,
         report.stats.decisions,
@@ -315,6 +362,7 @@ async fn project_status(
         "embedded": {"current": report.embedded.0, "total": report.embedded.1},
         "embedding_provider": report.embedding_provider,
         "vector_store": report.vector,
+        "session": report.session,
     });
     Ok(ToolResult::text(text, Some(structured)))
 }
@@ -347,6 +395,71 @@ fn checkpoint_latest(app: &App, default_project: Option<&str>, args: &Value) -> 
         None => Ok(ToolResult::text(
             format!("No checkpoint recorded for {} yet.", project.name),
             Some(json!({"checkpoint": null})),
+        )),
+    }
+}
+
+fn session_history(app: &App, default_project: Option<&str>, args: &Value) -> Result<ToolResult> {
+    let Some(project) = resolve_project(app, default_project, args)? else {
+        return Ok(ToolResult::error("no project: pass `project` or start the server inside one"));
+    };
+    let service = SessionService::new(app);
+    let limit = usize_arg(args, "limit").unwrap_or(5).clamp(1, 20);
+    let sessions = service.history(&project, limit)?;
+
+    if sessions.is_empty() {
+        return Ok(ToolResult::text(
+            format!("No working sessions recorded for {} yet.", project.name),
+            Some(json!({"sessions": []})),
+        ));
+    }
+
+    let activities: Vec<crate::core::session::SessionActivity> =
+        sessions.iter().map(|session| service.activity(session)).collect::<Result<_>>()?;
+
+    let mut text = format!("Recent sessions on {}:\n", project.name);
+    for activity in &activities {
+        text.push_str(&format!(
+            "\n{} \u{2014} {} ({})\n",
+            ids::short(&activity.session.id),
+            activity.headline(),
+            time::humanize_since(&activity.session.started_at)
+        ));
+        if let Some(summary) = &activity.session.summary {
+            text.push_str(&format!("  summary: {summary}\n"));
+        }
+        for checkpoint in &activity.checkpoints {
+            text.push_str(&format!("  checkpoint: {}\n", checkpoint.summary));
+        }
+        if !activity.memories.is_empty() {
+            text.push_str(&format!(
+                "  recorded {}\n",
+                crate::ui::plural(activity.memories.len(), "memory", "memories")
+            ));
+        }
+    }
+    Ok(ToolResult::text(text, Some(json!({"sessions": activities}))))
+}
+
+/// Record what the open session achieved, without closing it: the connection
+/// closing does that, and an agent should be able to say what it did before
+/// it disconnects.
+fn session_summarize(app: &App, default_project: Option<&str>, args: &Value) -> Result<ToolResult> {
+    let Some(summary) = str_arg(args, "summary") else {
+        return Ok(ToolResult::error("`summary` is required"));
+    };
+    let Some(project) = resolve_project(app, default_project, args)? else {
+        return Ok(ToolResult::error("no project: pass `project` or start the server inside one"));
+    };
+    match SessionService::new(app).summarize(&project, &summary)? {
+        Some(session) => Ok(ToolResult::text(
+            format!("Recorded for this session: {summary}"),
+            Some(serde_json::to_value(&session)?),
+        )),
+        None => Ok(ToolResult::text(
+            "No session is open, so there was nothing to summarise. Use checkpoint_create to \
+             record where the work stands.",
+            Some(json!({"session": null})),
         )),
     }
 }

@@ -49,6 +49,33 @@ impl SessionRepository for SqliteStore {
         Ok(changed > 0)
     }
 
+    /// The one session that has not been ended yet.
+    ///
+    /// More than one open session for a project should not happen — starting a
+    /// session closes any predecessor — but if it ever does, the newest wins,
+    /// which is what a user would expect after a crash left one behind.
+    fn open_session(&self, project_id: &str) -> Result<Option<Session>> {
+        let conn = self.conn();
+        let sql = format!(
+            "SELECT {COLUMNS} FROM sessions WHERE project_id = ?1 AND ended_at IS NULL
+              ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        );
+        Ok(conn.query_row(&sql, params![project_id], map_session).optional()?)
+    }
+
+    fn get_session(&self, id: &str) -> Result<Option<Session>> {
+        let conn = self.conn();
+        let sql = format!("SELECT {COLUMNS} FROM sessions WHERE id = ?1");
+        Ok(conn.query_row(&sql, params![id], map_session).optional()?)
+    }
+
+    fn summarize_session(&self, id: &str, summary: &str) -> Result<bool> {
+        let conn = self.conn();
+        let changed =
+            conn.execute("UPDATE sessions SET summary = ?2 WHERE id = ?1", params![id, summary])?;
+        Ok(changed > 0)
+    }
+
     fn latest_session(&self, project_id: &str) -> Result<Option<Session>> {
         let conn = self.conn();
         let sql = format!(
@@ -118,8 +145,49 @@ mod tests {
     }
 
     #[test]
+    fn open_session_is_the_one_without_an_end() {
+        let (store, project) = setup();
+        let first = Session {
+            id: crate::util::ids::new_id(),
+            project_id: project.id.clone(),
+            agent: Some("claude".into()),
+            started_at: time::now(),
+            ended_at: None,
+            summary: None,
+        };
+        store.start_session(&first).unwrap();
+        assert_eq!(store.open_session(&project.id).unwrap().unwrap().id, first.id);
+
+        store.end_session(&first.id, None).unwrap();
+        assert!(store.open_session(&project.id).unwrap().is_none());
+        assert_eq!(store.latest_session(&project.id).unwrap().unwrap().id, first.id);
+        assert_eq!(store.get_session(&first.id).unwrap().unwrap().id, first.id);
+        assert!(store.get_session("nope").unwrap().is_none());
+    }
+
+    #[test]
     fn ending_unknown_session_reports_false() {
         let (store, _) = setup();
         assert!(!store.end_session("nope", None).unwrap());
+        assert!(!store.summarize_session("nope", "x").unwrap());
+    }
+
+    #[test]
+    fn a_session_can_be_summarised_while_still_open() {
+        let (store, project) = setup();
+        let session = Session {
+            id: crate::util::ids::new_id(),
+            project_id: project.id.clone(),
+            agent: Some("claude".into()),
+            started_at: time::now(),
+            ended_at: None,
+            summary: None,
+        };
+        store.start_session(&session).unwrap();
+        assert!(store.summarize_session(&session.id, "wired up heartbeat").unwrap());
+
+        let loaded = store.open_session(&project.id).unwrap().unwrap();
+        assert_eq!(loaded.summary.as_deref(), Some("wired up heartbeat"));
+        assert!(loaded.ended_at.is_none(), "summarising must not close the session");
     }
 }

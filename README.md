@@ -100,6 +100,7 @@ MCP             ✓ contextd mcp serve
 | `recall` | Ask a question; hybrid semantic + keyword retrieval |
 | `checkpoint` / `resume` | Save and restore "where was I?" |
 | `decision add/list/show/supersede` | Architecture decision records |
+| `session start/end/list/show` | Working sessions and what they produced |
 | `refresh` | Merge duplicates, mark history, rebuild indexes |
 | `sync` | Write the Markdown mirror and bound agent files |
 | `import` / `export <agent>` | Move context in and out of agent files |
@@ -136,7 +137,8 @@ Tools exposed:
 | `project_status` | Counts, branch, index state |
 | `checkpoint_latest` | Current goal, done, next, open problems |
 | `architecture_decisions` | Decisions that currently hold |
-| `memory_add`, `checkpoint_create` | Writes (omitted in `--read-only`) |
+| `session_history` | Which agent worked when, and what came of it |
+| `memory_add`, `checkpoint_create`, `session_summarize` | Writes (omitted in `--read-only`) |
 
 Results carry lifecycle status, and anything superseded is labelled
 `NOT current` so a model does not mistake history for the present design.
@@ -182,6 +184,44 @@ contextd bundle import --file memory.json    # on the other
 Embeddings are not shipped — they are derived, the other machine may use a
 different provider, and a pull re-embeds locally faster than the transfer would
 take.
+
+## Sessions
+
+A session is one stretch of work on a project by one agent. `contextd mcp serve`
+opens one automatically when a client connects — the agent's name comes from the
+MCP handshake — and closes it when the connection goes. From a terminal:
+
+```sh
+contextd session start --agent claude
+contextd session end "heartbeat wired up"
+contextd session list
+contextd session show          # what the current or last session produced
+```
+
+Checkpoints made while a session is open are linked to it; memories and
+decisions are attributed by time window. That turns "what happened last time?"
+into a real answer:
+
+```
+$ contextd session show
+Session b506bd93
+─────────────────────────────────
+agent    claude
+window   2026-08-24T14:42:21Z → 2026-08-24T15:10:03Z
+ran      27m 42s
+summary  heartbeat wired up
+
+Checkpoints
+  6e702570 worker heartbeat completed
+
+Memories
+  069a5f19 [architecture] GPU scheduler uses NATS for task transport
+```
+
+Only one session is open per project: starting another closes the one before
+it, so an agent that crashed cannot collect the next agent's work. Sessions
+record activity on *this* machine, so they stay local — `contextd bundle`
+carries the knowledge, not the attendance.
 
 ## How retrieval works
 
@@ -311,7 +351,7 @@ client of `core` exactly as the CLI is — so the planned evolution (SQLite → 
 ```
 src/
 ├── cli/          argument parsing, rendering, one module per command group
-├── core/         model, project, memory, checkpoint, decision, context, refresh
+├── core/         model, project, memory, checkpoint, decision, session, context, refresh
 ├── storage/      repository traits + sqlite/ (migrations, FTS, vectors)
 ├── search/       fulltext, semantic, hybrid fusion, scoring, indexer
 │   └── vector/   VectorIndex trait, sqlite scan, qdrant client
@@ -366,7 +406,7 @@ summarizer          = "none" # or "openai" to consolidate clusters
 
 ## Status
 
-Working today: projects, memories, checkpoints, decisions, FTS5 search, hybrid
+Working today: projects, memories, checkpoints, decisions, sessions, FTS5 search, hybrid
 semantic recall, context budgeting, Claude/Codex/Cursor/generic adapters,
 Markdown mirror with conflict detection, refresh, cross-machine sync over SSH,
 pluggable embedding providers (local or any OpenAI-compatible endpoint),

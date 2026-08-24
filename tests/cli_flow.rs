@@ -360,3 +360,68 @@ fn remotes_are_configured_and_validated() {
     sandbox.run(&["remote", "remove", "lab"]);
     assert!(sandbox.run_json(&["remote", "list"]).as_array().unwrap().is_empty());
 }
+
+#[test]
+fn sessions_group_the_work_they_produced() {
+    let sandbox = Sandbox::new();
+    sandbox.bootstrap();
+
+    // Work done with no session open belongs to no session.
+    sandbox.run(&["checkpoint", "solo work"]);
+
+    let started = sandbox.run(&["session", "start", "--agent", "claude"]);
+    assert!(started.contains("Session open"));
+
+    sandbox.run(&["add", "-c", "architecture", "Scheduler transport is NATS"]);
+    sandbox.run(&["decision", "add", "Use NATS JetStream", "--title", "Task transport"]);
+    sandbox.run(&["checkpoint", "worker heartbeat completed"]);
+
+    // Status shows the open session.
+    let status = sandbox.run_json(&["status"]);
+    assert_eq!(status["session"]["session"]["agent"], "claude");
+    assert!(status["session"]["session"]["ended_at"].is_null());
+    assert!(sandbox.run(&["status"]).contains("Session"));
+
+    let show = sandbox.run_json(&["session", "show"]);
+    assert_eq!(show["checkpoints"].as_array().unwrap().len(), 1, "only the in-session checkpoint");
+    assert_eq!(show["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(show["decisions"].as_array().unwrap().len(), 1);
+
+    let ended = sandbox.run(&["session", "end", "heartbeat is done"]);
+    assert!(ended.contains("Session closed"));
+    assert!(ended.contains("worker heartbeat completed"));
+
+    // Closed sessions become the "what happened last time" line.
+    let listed = sandbox.run_json(&["session", "list"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["session"]["summary"], "heartbeat is done");
+
+    let resume = sandbox.run(&["resume"]);
+    assert!(resume.contains("Last session: claude"), "resume: {resume}");
+    assert!(resume.contains("heartbeat is done"), "resume: {resume}");
+
+    // Ending twice is harmless, and a new session starts clean.
+    assert!(sandbox.run(&["session", "end"]).contains("No session is open"));
+    sandbox.run(&["session", "start", "--agent", "codex"]);
+    assert!(sandbox.run_json(&["session", "show"])["checkpoints"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn starting_a_session_closes_one_left_open() {
+    let sandbox = Sandbox::new();
+    sandbox.bootstrap();
+    sandbox.run(&["session", "start", "--agent", "claude"]);
+    let restarted = sandbox.run(&["session", "start", "--agent", "codex"]);
+    assert!(restarted.contains("closed the session left open"), "{restarted}");
+
+    let sessions = sandbox.run_json(&["session", "list"]);
+    assert_eq!(sessions.as_array().unwrap().len(), 2);
+    let open: Vec<&serde_json::Value> = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|activity| activity["session"]["ended_at"].is_null())
+        .collect();
+    assert_eq!(open.len(), 1, "only one session may be open at a time");
+    assert_eq!(open[0]["session"]["agent"], "codex");
+}
