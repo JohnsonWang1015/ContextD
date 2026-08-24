@@ -690,10 +690,10 @@ mod tests {
         struct Uninitialised;
         impl RemoteTransport for Uninitialised {
             fn describe(&self) -> String {
-                "lab (johnson@140.123.105.18)".into()
+                "lab (dev@lab-box)".into()
             }
             fn destination(&self) -> Option<&str> {
-                Some("johnson@140.123.105.18")
+                Some("dev@lab-box")
             }
             fn run(&self, _args: &[String], _stdin: Option<&str>) -> Result<String> {
                 Err(Error::Other(anyhow::anyhow!(
@@ -706,7 +706,7 @@ mod tests {
         let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
         let err = RemoteSync::new(&local).scan(&Uninitialised).unwrap_err().to_string();
         assert!(err.contains("no store there yet"), "{err}");
-        assert!(err.contains("ssh johnson@140.123.105.18 contextd init"), "{err}");
+        assert!(err.contains("ssh dev@lab-box contextd init"), "{err}");
     }
 
     #[test]
@@ -750,7 +750,7 @@ mod tests {
 
     #[test]
     fn batch_mode_is_what_decides_whether_a_password_can_be_typed() {
-        let transport = SshTransport::new(RemoteConfig::new("lab", "johnson@140.123.105.18"))
+        let transport = SshTransport::new(RemoteConfig::new("lab", "dev@lab-box"))
             .unwrap()
             .with_interaction(Interaction::Batch);
         let args = transport.ssh_args();
@@ -771,7 +771,7 @@ mod tests {
     fn ssh_options_from_configuration_are_kept() {
         let transport = SshTransport::new(RemoteConfig {
             ssh_options: vec!["-p".into(), "2222".into()],
-            ..RemoteConfig::new("lab", "johnson@140.123.105.18")
+            ..RemoteConfig::new("lab", "dev@lab-box")
         })
         .unwrap();
         let args = transport.ssh_args();
@@ -781,13 +781,9 @@ mod tests {
 
     #[test]
     fn an_ad_hoc_destination_describes_itself_by_host() {
-        let transport = SshTransport::new(RemoteConfig::new(
-            "johnson@140.123.105.18",
-            "johnson@140.123.105.18",
-        ))
-        .unwrap();
-        assert_eq!(transport.describe(), "johnson@140.123.105.18");
-        assert_eq!(transport.destination(), Some("johnson@140.123.105.18"));
+        let transport = SshTransport::new(RemoteConfig::new("dev@lab-box", "dev@lab-box")).unwrap();
+        assert_eq!(transport.describe(), "dev@lab-box");
+        assert_eq!(transport.destination(), Some("dev@lab-box"));
     }
 
     #[test]
@@ -795,14 +791,14 @@ mod tests {
         struct Refused;
         impl RemoteTransport for Refused {
             fn describe(&self) -> String {
-                "johnson@140.123.105.18".into()
+                "dev@lab-box".into()
             }
             fn destination(&self) -> Option<&str> {
-                Some("johnson@140.123.105.18")
+                Some("dev@lab-box")
             }
             fn run(&self, _args: &[String], _stdin: Option<&str>) -> Result<String> {
                 Err(Error::Other(anyhow::anyhow!(
-                    "remote failed (exit status: 255): johnson@140.123.105.18: Permission denied \
+                    "remote failed (exit status: 255): dev@lab-box: Permission denied \
                      (publickey,password)."
                 )))
             }
@@ -811,7 +807,7 @@ mod tests {
         let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
         let err = RemoteSync::new(&local).scan(&Refused).unwrap_err().to_string();
         assert!(err.contains("--interactive"), "{err}");
-        assert!(err.contains("ssh-copy-id johnson@140.123.105.18"), "{err}");
+        assert!(err.contains("ssh-copy-id dev@lab-box"), "{err}");
     }
 
     #[test]
@@ -850,10 +846,10 @@ mod tests {
         struct Expanded(String);
         impl RemoteTransport for Expanded {
             fn describe(&self) -> String {
-                "lab18 (johnson@140.123.105.18)".into()
+                "lab18 (dev@lab-box)".into()
             }
             fn destination(&self) -> Option<&str> {
-                Some("johnson@140.123.105.18")
+                Some("dev@lab-box")
             }
             fn configured_command(&self) -> Option<&str> {
                 Some(&self.0)
@@ -883,7 +879,7 @@ mod tests {
     fn a_literal_home_variable_is_also_left_for_the_remote() {
         let transport = SshTransport::new(RemoteConfig {
             command: "$HOME/.local/bin/contextd".into(),
-            ..RemoteConfig::new("lab", "johnson@example")
+            ..RemoteConfig::new("lab", "dev@lab-box")
         })
         .unwrap();
         assert_eq!(
@@ -899,7 +895,7 @@ mod tests {
         // contextd is not on the default PATH.
         let transport = SshTransport::new(RemoteConfig {
             command: "~/.local/bin/contextd".into(),
-            ..RemoteConfig::new("lab", "johnson@example")
+            ..RemoteConfig::new("lab", "dev@lab-box")
         })
         .unwrap();
         let command = transport.remote_command(&["inventory".into(), "--json".into()]);
@@ -911,7 +907,7 @@ mod tests {
         let transport = SshTransport::new(RemoteConfig {
             login_shell: true,
             home: Some("/srv/state dir".into()),
-            ..RemoteConfig::new("lab", "johnson@example")
+            ..RemoteConfig::new("lab", "dev@lab-box")
         })
         .unwrap();
         let command = transport.remote_command(&["inventory".into(), "--json".into()]);

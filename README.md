@@ -214,8 +214,8 @@ resolved on that machine (`$CONTEXTD_HOME`, else `~/.contextd`) — pass
 Run it from a terminal and ssh asks, as it would on its own:
 
 ```sh
-$ contextd remote scan johnson@140.123.105.18
-johnson@140.123.105.18's password:
+$ contextd remote scan dev@lab-box
+dev@lab-box's password:
 ```
 
 Password prompts, host-key confirmations and 2FA all work because ssh reads
@@ -259,10 +259,10 @@ Each command opens its own connection, so `scan` then `pull` asks twice. Two
 ways to stop that:
 
 ```sh
-ssh-copy-id johnson@140.123.105.18          # key-based auth, asked once, ever
+ssh-copy-id dev@lab-box          # key-based auth, asked once, ever
 
 # or reuse one authenticated connection for a few minutes
-contextd remote add lab johnson@140.123.105.18 \
+contextd remote add lab dev@lab-box \
   --ssh-option=-o --ssh-option=ControlMaster=auto \
   --ssh-option=-o --ssh-option=ControlPath=~/.ssh/cm-%r@%h:%p \
   --ssh-option=-o --ssh-option=ControlPersist=5m

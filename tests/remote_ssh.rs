@@ -295,24 +295,24 @@ fn password_prompting_is_allowed_unless_batch_is_asked_for() {
     };
 
     // Asking for interaction must not disable ssh's password prompt.
-    let args = run(&["remote", "scan", "johnson@140.123.105.18", "--interactive"]);
+    let args = run(&["remote", "scan", "dev@lab-box", "--interactive"]);
     assert!(
         !args.iter().any(|arg| arg == "BatchMode=yes"),
         "BatchMode would suppress the password prompt: {args:?}"
     );
     assert!(args.iter().any(|arg| arg == "NumberOfPasswordPrompts=3"), "{args:?}");
-    assert!(args.iter().any(|arg| arg == "johnson@140.123.105.18"), "{args:?}");
+    assert!(args.iter().any(|arg| arg == "dev@lab-box"), "{args:?}");
     assert!(
         args.last().is_some_and(|last| last.contains("contextd inventory --json")),
         "the remote command is the final argument: {args:?}"
     );
 
     // A scripted run must fail rather than wait for a password nobody types.
-    let args = run(&["remote", "scan", "johnson@140.123.105.18", "--batch"]);
+    let args = run(&["remote", "scan", "dev@lab-box", "--batch"]);
     assert!(args.iter().any(|arg| arg == "BatchMode=yes"), "{args:?}");
 
     // The same choice applies to pull and push.
-    let args = run(&["remote", "pull", "johnson@140.123.105.18", "--batch"]);
+    let args = run(&["remote", "pull", "dev@lab-box", "--batch"]);
     assert!(args.is_empty() || args.iter().any(|arg| arg == "BatchMode=yes"), "{args:?}");
 }
 
@@ -326,7 +326,7 @@ fn a_refused_password_login_explains_the_next_step() {
     let script = bin.join("ssh");
     std::fs::write(
         &script,
-        "#!/bin/sh\necho 'johnson@140.123.105.18: Permission denied (publickey,password).' >&2\nexit 255\n",
+        "#!/bin/sh\necho 'dev@lab-box: Permission denied (publickey,password).' >&2\nexit 255\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -335,12 +335,12 @@ fn a_refused_password_login_explains_the_next_step() {
     let output = sandbox
         .cmd()
         .env("PATH", format!("{}:{existing}", bin.display()))
-        .args(["remote", "scan", "johnson@140.123.105.18"])
+        .args(["remote", "scan", "dev@lab-box"])
         .output()
         .unwrap();
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("refused the login"), "stderr: {stderr}");
-    assert!(stderr.contains("ssh-copy-id johnson@140.123.105.18"), "stderr: {stderr}");
+    assert!(stderr.contains("ssh-copy-id dev@lab-box"), "stderr: {stderr}");
 }
