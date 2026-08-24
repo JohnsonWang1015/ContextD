@@ -7,7 +7,9 @@
 //! wrote it is reported as a conflict rather than overwritten.
 
 pub mod agent_sync;
+pub mod bundle;
 pub mod mirror;
+pub mod remote;
 
 use std::path::{Path, PathBuf};
 

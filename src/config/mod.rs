@@ -26,6 +26,9 @@ pub struct Config {
     pub context: ContextConfig,
     pub refresh: RefreshConfig,
     pub sync: SyncConfig,
+    /// Machines whose memory can be pulled or pushed over SSH.
+    #[serde(default, rename = "remote")]
+    pub remotes: Vec<RemoteConfig>,
 }
 
 /// General behaviour.
@@ -182,7 +185,81 @@ impl Default for SyncConfig {
     }
 }
 
+/// One machine ContextD can exchange memory with.
+///
+/// Remotes live in the config file rather than the database: they describe
+/// *this* machine's view of the network, not memory, and a developer should be
+/// able to add one with an editor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteConfig {
+    /// Short name used on the command line.
+    pub name: String,
+    /// SSH destination, e.g. `dev@lab-box` or a `~/.ssh/config` host alias.
+    pub host: String,
+    /// How to invoke ContextD over there.
+    pub command: String,
+    /// `CONTEXTD_HOME` on the remote machine, when it is not the default.
+    pub home: Option<String>,
+    /// Extra arguments passed to `ssh` (`-p 2222`, `-i key`, `-J jump`, …).
+    pub ssh_options: Vec<String>,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: String::new(),
+            command: "contextd".into(),
+            home: None,
+            ssh_options: Vec::new(),
+        }
+    }
+}
+
+impl RemoteConfig {
+    pub fn new(name: impl Into<String>, host: impl Into<String>) -> Self {
+        Self { name: name.into(), host: host.into(), ..Default::default() }
+    }
+
+    /// Reject the shapes that would produce a confusing failure much later.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(Error::invalid("remote.name", "must not be empty"));
+        }
+        if self.host.trim().is_empty() {
+            return Err(Error::invalid("remote.host", "must not be empty"));
+        }
+        if self.command.trim().is_empty() {
+            return Err(Error::invalid("remote.command", "must not be empty"));
+        }
+        Ok(())
+    }
+}
+
 impl Config {
+    /// Find a configured remote by name.
+    pub fn remote(&self, name: &str) -> Option<&RemoteConfig> {
+        self.remotes.iter().find(|r| r.name.eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// Add or replace a remote by name.
+    pub fn upsert_remote(&mut self, remote: RemoteConfig) -> Result<()> {
+        remote.validate()?;
+        match self.remotes.iter_mut().find(|r| r.name.eq_ignore_ascii_case(&remote.name)) {
+            Some(existing) => *existing = remote,
+            None => self.remotes.push(remote),
+        }
+        Ok(())
+    }
+
+    /// Remove a remote, reporting whether it existed.
+    pub fn remove_remote(&mut self, name: &str) -> bool {
+        let before = self.remotes.len();
+        self.remotes.retain(|r| !r.name.eq_ignore_ascii_case(name.trim()));
+        self.remotes.len() != before
+    }
+
     /// Load from `path`, or return defaults when the file does not exist.
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
@@ -221,6 +298,9 @@ impl Config {
                 "must not exceed refresh.duplicate_threshold",
             ));
         }
+        for remote in &self.remotes {
+            remote.validate()?;
+        }
         Ok(())
     }
 }
@@ -252,6 +332,46 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.context.max_context_tokens, 100);
         assert_eq!(cfg.embeddings.provider, "local");
+    }
+
+    #[test]
+    fn remotes_roundtrip_and_are_addressable_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config
+            .upsert_remote(RemoteConfig {
+                ssh_options: vec!["-p".into(), "2222".into()],
+                ..RemoteConfig::new("lab", "dev@lab-box")
+            })
+            .unwrap();
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.remote("LAB").unwrap().host, "dev@lab-box");
+        assert!(loaded.remote("nope").is_none());
+    }
+
+    #[test]
+    fn upsert_replaces_and_remove_reports() {
+        let mut config = Config::default();
+        config.upsert_remote(RemoteConfig::new("lab", "old-host")).unwrap();
+        config.upsert_remote(RemoteConfig::new("lab", "new-host")).unwrap();
+        assert_eq!(config.remotes.len(), 1);
+        assert_eq!(config.remote("lab").unwrap().host, "new-host");
+
+        assert!(config.remove_remote("lab"));
+        assert!(!config.remove_remote("lab"));
+    }
+
+    #[test]
+    fn invalid_remotes_are_rejected() {
+        let mut config = Config::default();
+        assert!(config.upsert_remote(RemoteConfig::new("", "host")).is_err());
+        assert!(config.upsert_remote(RemoteConfig::new("lab", "  ")).is_err());
+        config.remotes.push(RemoteConfig::new("broken", ""));
+        assert!(config.validate().is_err());
     }
 
     #[test]

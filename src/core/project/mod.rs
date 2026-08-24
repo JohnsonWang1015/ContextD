@@ -85,7 +85,16 @@ impl<'a> ProjectService<'a> {
         let detection = self.detect(&request.dir, &[]);
         let store = self.app.store();
 
-        if let Some(mut existing) = store.find_project_by_path(&detection.root)? {
+        // A project pulled from another machine has no local path yet (its
+        // path belonged to that machine). Attaching the same repository here
+        // adopts it instead of creating a second project for the same code.
+        let adopted = match store.find_project_by_path(&detection.root)? {
+            Some(existing) => Some(existing),
+            None => self.adoptable(&detection)?,
+        };
+
+        if let Some(mut existing) = adopted {
+            existing.root_path = Some(detection.root.clone());
             existing.git_remote = detection.git.remote.clone().or(existing.git_remote);
             existing.default_branch = detection.git.branch.clone().or(existing.default_branch);
             if let Some(description) = request.description {
@@ -114,6 +123,21 @@ impl<'a> ProjectService<'a> {
         store.create_project(&project)?;
         self.record_bindings(&project, &request.bindings)?;
         Ok((project, true))
+    }
+
+    /// A path-less project that describes the repository being attached.
+    ///
+    /// Matching is by git remote — the only identity a repository carries
+    /// across machines. Name alone is too weak: two unrelated checkouts called
+    /// `api` must not merge.
+    fn adoptable(&self, detection: &Detection) -> Result<Option<Project>> {
+        let Some(remote) = detection.git.remote.as_ref().filter(|r| !r.trim().is_empty()) else {
+            return Ok(None);
+        };
+        Ok(self.app.store().list_projects(true)?.into_iter().find(|candidate| {
+            candidate.root_path.is_none()
+                && candidate.git_remote.as_deref().is_some_and(|url| same_repository(url, remote))
+        }))
     }
 
     /// Detach a project. By default the memories are kept and the project is
@@ -208,6 +232,18 @@ impl<'a> ProjectService<'a> {
     }
 }
 
+/// Whether two git remote URLs name the same repository.
+fn same_repository(a: &str, b: &str) -> bool {
+    fn key(url: &str) -> String {
+        let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+        let without_scheme = trimmed.split_once("://").map(|(_, rest)| rest).unwrap_or(trimmed);
+        let without_user =
+            without_scheme.split_once('@').map(|(_, rest)| rest).unwrap_or(without_scheme);
+        without_user.replace(':', "/").to_lowercase()
+    }
+    key(a) == key(b)
+}
+
 /// `git@github.com:acme/FerroGrid.git` → `FerroGrid`.
 fn name_from_remote(remote: &str) -> Option<String> {
     let trimmed = remote.trim_end_matches('/').trim_end_matches(".git");
@@ -296,6 +332,48 @@ mod tests {
             .unwrap();
         assert_eq!(p1.slug, "repo");
         assert_eq!(p2.slug, "repo-2");
+    }
+
+    #[test]
+    fn attach_adopts_a_project_pulled_from_another_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let app = app_in(dir.path());
+
+        // As a bundle merge would leave it: known repository, no local path.
+        let pulled = Project {
+            id: crate::util::ids::new_id(),
+            name: "FerroGrid".into(),
+            slug: "ferrogrid".into(),
+            root_path: None,
+            description: None,
+            git_remote: Some("git@github.com:acme/FerroGrid.git".into()),
+            default_branch: None,
+            created_at: time::now(),
+            updated_at: time::now(),
+            active: true,
+        };
+        app.store().create_project(&pulled).unwrap();
+
+        let service = ProjectService::new(&app);
+        let mut detection = service.detect(&repo, &[]);
+        detection.git.remote = Some("https://github.com/acme/FerroGrid".into());
+        let adopted = service.adoptable(&detection).unwrap().expect("should adopt");
+        assert_eq!(adopted.id, pulled.id);
+
+        // A different repository must not be adopted.
+        detection.git.remote = Some("git@github.com:acme/other.git".into());
+        assert!(service.adoptable(&detection).unwrap().is_none());
+    }
+
+    #[test]
+    fn same_repository_ignores_url_form() {
+        assert!(same_repository(
+            "git@github.com:acme/FerroGrid.git",
+            "https://github.com/acme/FerroGrid"
+        ));
+        assert!(!same_repository("git@github.com:acme/one", "git@github.com:acme/two"));
     }
 
     #[test]

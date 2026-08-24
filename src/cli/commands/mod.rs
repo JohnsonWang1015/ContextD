@@ -11,4 +11,5 @@ pub mod maintenance;
 pub mod mcp;
 pub mod memory;
 pub mod project;
+pub mod remote;
 pub mod search;

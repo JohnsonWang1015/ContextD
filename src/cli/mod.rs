@@ -143,6 +143,14 @@ pub enum Command {
     /// Write the Markdown mirror and bound agent files.
     Sync(commands::maintenance::SyncArgs),
 
+    /// Exchange memory with another machine over SSH.
+    #[command(subcommand)]
+    Remote(commands::remote::RemoteCommand),
+
+    /// Move memory in and out as a JSON bundle.
+    #[command(subcommand)]
+    Bundle(commands::remote::BundleCommand),
+
     /// Import context from an agent's files.
     Import(commands::agent::ImportArgs),
 
@@ -213,6 +221,8 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Decision(command) => commands::decision::run(&app, global, command),
         Command::Refresh(args) => commands::maintenance::refresh(&app, global, &args).await,
         Command::Sync(args) => commands::maintenance::sync(&app, global, &args).await,
+        Command::Remote(command) => commands::remote::run_remote(&app, global, command).await,
+        Command::Bundle(command) => commands::remote::run_bundle(&app, global, command).await,
         Command::Import(args) => commands::agent::import(&app, global, &args),
         Command::Export(args) => commands::agent::export(&app, global, &args).await,
         Command::Mcp(command) => commands::mcp::run(&app, global, command).await,

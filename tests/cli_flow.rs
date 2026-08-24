@@ -267,3 +267,96 @@ fn detach_keeps_memories_and_reattach_finds_them() {
     let memories = sandbox.run_json(&["memories"]);
     assert_eq!(memories.as_array().unwrap().len(), 1, "memories survive a detach");
 }
+
+#[test]
+fn memory_moves_between_machines_as_a_bundle() {
+    // Two independent ContextD installations, the same repository.
+    let laptop = Sandbox::new();
+    laptop.run(&["init"]);
+    laptop.run(&["attach", "--name", "FerroGrid"]);
+    laptop.run(&["add", "-c", "architecture", "Scheduler transport is NATS"]);
+    laptop.run(&["decision", "add", "Use NATS JetStream", "--title", "Task transport"]);
+    laptop.run(&["checkpoint", "heartbeat done", "--next", "GPU lease allocation"]);
+
+    let bundle_path = laptop.dir.path().join("memory.json");
+    laptop.run(&["bundle", "export", "--out", bundle_path.to_str().unwrap()]);
+    assert!(bundle_path.is_file());
+
+    let desktop = Sandbox::new();
+    desktop.run(&["init"]);
+    desktop.run(&["attach", "--name", "FerroGrid"]);
+
+    let report = desktop.run_json(&["bundle", "import", "--file", bundle_path.to_str().unwrap()]);
+    assert_eq!(report["memories_added"], 1);
+    assert_eq!(report["decisions_added"], 1);
+    assert_eq!(report["checkpoints_added"], 1);
+
+    // The receiving machine can now answer questions about the work.
+    let recall = desktop.run(&["recall", "which transport does the scheduler use?"]);
+    assert!(recall.contains("NATS"), "recall on the second machine: {recall}");
+    let resume = desktop.run(&["resume"]);
+    assert!(resume.contains("GPU lease allocation"), "resume: {resume}");
+
+    // Re-importing changes nothing.
+    let again = desktop.run_json(&["bundle", "import", "--file", bundle_path.to_str().unwrap()]);
+    assert_eq!(again["memories_added"], 0);
+    assert_eq!(again["memories_unchanged"], 1);
+    assert_eq!(desktop.run_json(&["memories"]).as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn bundle_import_dry_run_and_stdin() {
+    let laptop = Sandbox::new();
+    laptop.bootstrap();
+    laptop.run(&["add", "-c", "knowledge", "Build with cargo build --release"]);
+    let bundle = laptop.run(&["bundle", "export"]);
+
+    let desktop = Sandbox::new();
+    desktop.run(&["init"]);
+
+    // stdin is the path `contextd remote push` uses over SSH.
+    let mut child = desktop
+        .cmd()
+        .args(["bundle", "import", "--stdin", "--dry-run", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(bundle.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("merge report on stdout");
+    assert_eq!(report["memories_added"], 1);
+    assert_eq!(report["dry_run"], true);
+
+    // Dry run wrote nothing.
+    assert!(desktop.run_json(&["memories", "--all"]).as_array().unwrap().is_empty());
+}
+
+#[test]
+fn remotes_are_configured_and_validated() {
+    let sandbox = Sandbox::new();
+    sandbox.bootstrap();
+
+    sandbox.run(&["remote", "add", "lab", "dev@lab-box", "--ssh-option=-p", "--ssh-option=2222"]);
+    let remotes = sandbox.run_json(&["remote", "list"]);
+    assert_eq!(remotes[0]["name"], "lab");
+    assert_eq!(remotes[0]["host"], "dev@lab-box");
+
+    // The config file is the source of truth and stays human-editable.
+    let config = std::fs::read_to_string(sandbox.home().join("config.toml")).unwrap();
+    assert!(config.contains("[[remote]]"), "config.toml: {config}");
+    assert!(config.contains("dev@lab-box"));
+
+    // Unknown remote fails with a helpful message rather than an ssh error.
+    let stderr = sandbox.run_failing(&["remote", "pull", "desktop"]);
+    assert!(stderr.contains("no remote named `desktop`"), "stderr: {stderr}");
+    assert!(stderr.contains("configured: lab"), "stderr: {stderr}");
+
+    sandbox.run(&["remote", "remove", "lab"]);
+    assert!(sandbox.run_json(&["remote", "list"]).as_array().unwrap().is_empty());
+}
