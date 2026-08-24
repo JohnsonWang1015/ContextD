@@ -240,11 +240,16 @@ ssh you@host 'bash -lc "command -v contextd"'       # found? a PATH problem
 Either fix works:
 
 ```sh
-contextd remote add lab you@host --login-shell               # read ~/.profile first
-contextd remote add lab you@host --command ~/.local/bin/contextd
+contextd remote add lab you@host --login-shell                 # read ~/.profile first
+contextd remote add lab you@host --command '~/.local/bin/contextd'
 ```
 
-A `~/`-relative command path is expanded on the remote rather than quoted, and
+Note the quotes. Without them your own shell expands `~` before ContextD sees
+it, and the remote is configured with a path from *this* machine — which is
+worth knowing when the two accounts have different home directories. ContextD
+says so if you forget.
+
+A quoted `~/` or `$HOME/` path is expanded on the remote rather than here, and
 a login shell that prints a banner does not break anything — the JSON payload
 is picked out of the output.
 

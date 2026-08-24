@@ -44,6 +44,11 @@ pub trait RemoteTransport: Send + Sync {
         None
     }
 
+    /// The command this transport was configured to run remotely.
+    fn configured_command(&self) -> Option<&str> {
+        None
+    }
+
     /// Run `contextd <args>` on the remote machine and return its stdout.
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String>;
 }
@@ -159,6 +164,10 @@ impl RemoteTransport for SshTransport {
         Some(&self.config.host)
     }
 
+    fn configured_command(&self) -> Option<&str> {
+        Some(&self.config.command)
+    }
+
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String> {
         let mut command = Command::new("ssh");
         command.args(self.ssh_args());
@@ -195,6 +204,17 @@ impl RemoteTransport for SshTransport {
     }
 }
 
+/// A command path that points inside *this* machine's home directory.
+///
+/// Nothing forbids the two machines having the same layout, so this is only a
+/// hint — but when a remote command cannot be found and its path is one the
+/// local shell would produce from `~`, that is almost always what happened.
+fn locally_expanded_home_path(command: Option<&str>) -> Option<String> {
+    let command = command?;
+    let home = directories::BaseDirs::new()?.home_dir().to_string_lossy().into_owned();
+    (!home.is_empty() && command.starts_with(&home)).then(|| command.to_string())
+}
+
 /// The JSON document in a remote command's output.
 ///
 /// A login shell may print a banner, a message of the day or a stray `echo`
@@ -220,8 +240,10 @@ fn json_payload(stdout: &str) -> &str {
 /// would reach the remote shell as a literal tilde and fail, which is exactly
 /// the path someone reaches for when contextd is not on the default PATH.
 fn shell_quote(value: &str) -> String {
-    if let Some(rest) = value.strip_prefix("~/") {
-        return format!("\"$HOME\"/{}", quote_plain(rest));
+    for prefix in ["~/", "$HOME/"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            return format!("\"$HOME\"/{}", quote_plain(rest));
+        }
     }
     quote_plain(value)
 }
@@ -404,6 +426,16 @@ fn explain_remote_failure(transport: &dyn RemoteTransport, err: Error) -> Error 
         ));
     }
     if text.contains("command not found") || text.contains("No such file or directory") {
+        if let Some(local) = locally_expanded_home_path(transport.configured_command()) {
+            return Error::Other(anyhow::anyhow!(
+                "contextd was not found on {}. It is configured as `{local}`, which is inside \
+                 *this* machine's home directory — a `~` in the argument was expanded by your \
+                 own shell before ContextD saw it. Quote it so the remote expands it:\n\
+                 \u{20} contextd remote add <name> {dest} --command '~/.local/bin/contextd'",
+                transport.describe(),
+                dest = transport.destination().unwrap_or("user@host")
+            ));
+        }
         return Error::Other(anyhow::anyhow!(
             "contextd was not found on {}. Check with `ssh {dest} 'command -v contextd'`:\n\
              \u{20} · nothing there → install it on that machine\n\
@@ -805,6 +837,58 @@ mod tests {
         assert!(
             !command.contains("Ferro'; rm"),
             "the quote was not escaped, so the shell would run it: {command}"
+        );
+    }
+
+    #[test]
+    fn a_shell_expanded_tilde_is_recognised_and_explained() {
+        // What `--command ~/.local/bin/contextd` becomes when the local shell
+        // expands it before ContextD ever sees the tilde.
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_path_buf();
+        let local_path = home.join(".local/bin/contextd").to_string_lossy().into_owned();
+
+        struct Expanded(String);
+        impl RemoteTransport for Expanded {
+            fn describe(&self) -> String {
+                "lab18 (johnson@140.123.105.18)".into()
+            }
+            fn destination(&self) -> Option<&str> {
+                Some("johnson@140.123.105.18")
+            }
+            fn configured_command(&self) -> Option<&str> {
+                Some(&self.0)
+            }
+            fn run(&self, _args: &[String], _stdin: Option<&str>) -> Result<String> {
+                Err(Error::Other(anyhow::anyhow!(
+                    "remote `lab18` failed (exit status: 127): bash: line 1: \
+                     /home/someone/.local/bin/contextd: No such file or directory"
+                )))
+            }
+        }
+
+        let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
+        let err = RemoteSync::new(&local).scan(&Expanded(local_path)).unwrap_err().to_string();
+        assert!(err.contains("expanded by your own shell"), "{err}");
+        assert!(err.contains("--command '~/.local/bin/contextd'"), "{err}");
+
+        // A path outside the local home gets the general advice instead.
+        let err = RemoteSync::new(&local)
+            .scan(&Expanded("/opt/contextd".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("command -v contextd"), "{err}");
+    }
+
+    #[test]
+    fn a_literal_home_variable_is_also_left_for_the_remote() {
+        let transport = SshTransport::new(RemoteConfig {
+            command: "$HOME/.local/bin/contextd".into(),
+            ..RemoteConfig::new("lab", "johnson@example")
+        })
+        .unwrap();
+        assert_eq!(
+            transport.remote_command(&["inventory".into()]),
+            "\"$HOME\"/.local/bin/contextd inventory"
         );
     }
 

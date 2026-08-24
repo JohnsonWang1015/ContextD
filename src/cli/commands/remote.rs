@@ -266,9 +266,14 @@ fn add(app: &App, global: &GlobalArgs, args: &AddRemoteArgs) -> Result<()> {
     config.upsert_remote(remote.clone())?;
     config.save(&path)?;
 
+    // A `~` in --command is expanded by the *local* shell, so the stored path
+    // silently becomes a local one. Say so now rather than after a failed
+    // connection and a typed password.
+    let shell_expanded_home = local_home_prefix(&remote.command);
+
     output::render(global, &remote, || {
         let verb = if replaced { "Updated" } else { "Added" };
-        format!(
+        let mut text = format!(
             "{}\n{}\n\n{}",
             ui::ok(&format!("{verb} remote {}", ui::bold(&remote.name))),
             ui::kv(&[
@@ -278,10 +283,21 @@ fn add(app: &App, global: &GlobalArgs, args: &AddRemoteArgs) -> Result<()> {
                 ("shell", if remote.login_shell { "login".into() } else { "default".into() }),
             ]),
             ui::hint(&format!(
-                "Try `contextd remote pull {} --dry-run` to check the connection.",
+                "Try `contextd remote scan {}` to check the connection.",
                 remote.name
             ))
-        )
+        );
+        if shell_expanded_home {
+            text.push_str(&format!(
+                "\n\n{}\n{}",
+                ui::warn(&format!("`{}` is inside this machine's home directory.", remote.command)),
+                ui::hint(
+                    "If you typed `~/...`, your shell expanded it here. Quote it so the other \
+                     machine expands it instead: --command '~/.local/bin/contextd'"
+                )
+            ));
+        }
+        text
     })
 }
 
@@ -363,6 +379,15 @@ fn scan(app: &App, global: &GlobalArgs, args: &ScanArgs) -> Result<()> {
     output::render(global, &inventory, || {
         render_inventory(&inventory, args.detail, &args.remote, Some(next_step.as_str()))
     })
+}
+
+/// Whether a path lies inside this machine's home directory, which is what a
+/// locally expanded `~` looks like once the shell is done with it.
+fn local_home_prefix(command: &str) -> bool {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+        .filter(|home| !home.is_empty())
+        .is_some_and(|home| command.starts_with(&home))
 }
 
 /// `dev@lab-box`, `lab-box`, or a `~/.ssh/config` alias — anything that is not
