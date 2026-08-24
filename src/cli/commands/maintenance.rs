@@ -35,6 +35,13 @@ pub struct RefreshArgs {
     /// Similarity above which two memories count as duplicates (0.0–1.0).
     #[arg(long, value_name = "N")]
     pub duplicate_threshold: Option<f64>,
+
+    /// Re-publish every stored vector to the configured vector store.
+    ///
+    /// Use after switching backend or embedding model: it moves what SQLite
+    /// already holds into the index without paying to embed anything again.
+    #[arg(long)]
+    pub reindex_vectors: bool,
 }
 
 /// `contextd sync`
@@ -82,6 +89,17 @@ pub async fn refresh(app: &App, global: &GlobalArgs, args: &RefreshArgs) -> Resu
         report.notes.extend(global_report.notes);
     }
 
+    if args.reindex_vectors && !args.dry_run {
+        let republished = crate::search::IndexService::new(app).reindex_vectors().await?;
+        report.notes.push(if republished > 0 {
+            format!("re-published {republished} vectors to {}", app.config().vector.backend)
+        } else {
+            "vector store is the built-in SQLite index; nothing to re-publish".to_string()
+        });
+    }
+
+    let index_error = report.index_error.clone();
+
     output::render(global, &report, || {
         let mut text = format!("{}\n", ui::header("Refresh"));
         text.push_str(&ui::kv(&[
@@ -121,7 +139,16 @@ pub async fn refresh(app: &App, global: &GlobalArgs, args: &RefreshArgs) -> Resu
             text.push_str(&format!("\n{}", ui::dim(&format!("  {note}"))));
         }
         text
-    })
+    })?;
+
+    // Memory was tidied and the full-text index rebuilt; only the semantic
+    // index is stale. Say so, and exit non-zero so a scripted refresh notices.
+    match index_error {
+        Some(detail) => Err(crate::error::Error::Other(anyhow::anyhow!(
+            "memories were tidied, but the semantic index was not rebuilt: {detail}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Write the Markdown mirror and any bound agent files.

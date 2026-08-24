@@ -233,10 +233,21 @@ pub async fn edit(app: &App, global: &GlobalArgs, args: &EditArgs) -> Result<()>
 }
 
 /// Delete or archive a memory.
-pub fn delete(app: &App, global: &GlobalArgs, args: &DeleteArgs) -> Result<()> {
+pub async fn delete(app: &App, global: &GlobalArgs, args: &DeleteArgs) -> Result<()> {
     let service = MemoryService::new(app);
     let memory =
         if args.archive { service.archive(&args.id)? } else { service.delete(&args.id)? };
+
+    // An external vector store has to be told; the SQLite one holds the
+    // vectors that were just removed with the record itself.
+    let indexer = IndexService::new(app);
+    if args.archive {
+        // Archived records stay stored but are never retrieved, so the index
+        // payload is refreshed rather than dropped.
+        let _ = indexer.embed_record(&RecordRef::memory(&memory.id)).await;
+    } else {
+        indexer.forget_record(&RecordRef::memory(&memory.id)).await?;
+    }
 
     output::render(global, &memory, || {
         if args.archive {

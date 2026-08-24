@@ -137,19 +137,34 @@ impl<'a> SearchService<'a> {
             HashMap::new()
         };
 
-        // With no provider configured the semantic arm simply contributes
-        // nothing; hybrid search degrades to lexical rather than failing.
+        // The semantic arm is best effort. With no provider configured it
+        // contributes nothing; if the provider or the vector store is
+        // unreachable it also contributes nothing, and the search still
+        // answers from the local full-text index. Losing recall quality while
+        // a service is down is far better than losing search altogether — the
+        // failure is logged so it does not pass unnoticed.
         let semantic_scores = match (use_semantic, self.app.embedder()) {
             (true, Some(provider)) => {
-                crate::search::semantic::candidates(
-                    store,
+                match crate::search::semantic::candidates(
+                    self.app.vector(),
                     provider,
                     &request.query,
                     &request.scope,
                     &request.kinds,
                     candidate_limit,
                 )
-                .await?
+                .await
+                {
+                    Ok(scores) => scores,
+                    Err(err) if request.mode == SearchMode::Semantic => return Err(err),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "semantic search unavailable; answering from the full-text index only"
+                        );
+                        HashMap::new()
+                    }
+                }
             }
             _ => HashMap::new(),
         };
@@ -535,6 +550,88 @@ mod tests {
             SearchService::new(&f.app).search(&SearchRequest::new("scheduler")).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].breakdown.semantic, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_failing_semantic_arm_falls_back_to_keywords() {
+        use crate::search::vector::{VectorIndex, VectorMatch, VectorQuery};
+
+        /// A vector store that is down.
+        struct Broken;
+
+        impl VectorIndex for Broken {
+            fn backend(&self) -> &str {
+                "broken"
+            }
+            fn is_external(&self) -> bool {
+                true
+            }
+            fn upsert<'a>(
+                &'a self,
+                _points: &'a [crate::search::vector::VectorPoint],
+            ) -> crate::embeddings::provider::BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn delete<'a>(
+                &'a self,
+                _records: &'a [RecordRef],
+            ) -> crate::embeddings::provider::BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a VectorQuery,
+            ) -> crate::embeddings::provider::BoxFuture<'a, Result<Vec<VectorMatch>>> {
+                Box::pin(async {
+                    Err(crate::error::Error::VectorStore(
+                        "broken".into(),
+                        "connection refused".into(),
+                    ))
+                })
+            }
+            fn clear(&self) -> crate::embeddings::provider::BoxFuture<'_, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn health(
+                &self,
+            ) -> crate::embeddings::provider::BoxFuture<
+                '_,
+                Result<crate::search::vector::VectorHealth>,
+            > {
+                Box::pin(async {
+                    Ok(crate::search::vector::VectorHealth {
+                        backend: "broken".into(),
+                        reachable: false,
+                        points: None,
+                        detail: None,
+                    })
+                })
+            }
+        }
+
+        let mut f = fixture().await;
+        f.app.set_vector(std::sync::Arc::new(Broken));
+        MemoryService::new(&f.app)
+            .add(NewMemory {
+                project: Some(f.project.clone()),
+                ..NewMemory::new(Category::Architecture, "Scheduler transport is NATS")
+            })
+            .unwrap();
+
+        let hits =
+            SearchService::new(&f.app).search(&SearchRequest::new("transport")).await.unwrap();
+        assert_eq!(hits.len(), 1, "keyword results must survive a broken vector store");
+        assert_eq!(hits[0].breakdown.semantic, 0.0);
+
+        // An explicitly semantic-only search has nothing to fall back to and
+        // reports the failure instead of pretending there are no matches.
+        let semantic_only = SearchService::new(&f.app)
+            .search(&SearchRequest {
+                mode: SearchMode::Semantic,
+                ..SearchRequest::new("transport")
+            })
+            .await;
+        assert!(semantic_only.is_err());
     }
 
     #[tokio::test]

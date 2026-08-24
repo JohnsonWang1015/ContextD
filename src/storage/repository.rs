@@ -138,11 +138,14 @@ impl IndexableRecord {
     }
 }
 
-/// A stored vector along with just enough metadata to rank it.
+/// A stored vector along with just enough metadata to rank and filter it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddedRecord {
     pub record: RecordRef,
     pub project_id: Option<String>,
+    /// Lifecycle of the underlying record. Decisions map onto the same scale
+    /// (a replaced ADR is `Superseded`) so one filter covers every kind.
+    pub status: Status,
     pub vector: Vec<f32>,
 }
 

@@ -12,6 +12,7 @@ use crate::config::{Config, Paths};
 use crate::core::model::Project;
 use crate::embeddings::EmbeddingProvider;
 use crate::error::{Error, Result};
+use crate::search::vector::VectorIndex;
 use crate::storage::repository::{ProjectScope, Storage};
 use crate::storage::SqliteStore;
 
@@ -23,6 +24,8 @@ pub struct App {
     store: Arc<dyn Storage>,
     /// `None` when embeddings are switched off in configuration.
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Where vectors are indexed: SQLite by default, Qdrant when configured.
+    vector: Arc<dyn VectorIndex>,
     cwd: PathBuf,
 }
 
@@ -48,16 +51,31 @@ impl App {
         paths.ensure_dirs()?;
         let config = Config::load(&paths.config_file())?;
         config.validate()?;
-        let store = SqliteStore::open(&paths.database())?;
+        let store: Arc<dyn Storage> = Arc::new(SqliteStore::open(&paths.database())?);
         let embedder = crate::embeddings::build(&config.embeddings)?;
+        let vector = crate::search::vector::build(&config.vector, Arc::clone(&store))?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Ok(Self { paths, config, store: Arc::new(store), embedder, cwd })
+        Ok(Self { paths, config, store, embedder, vector, cwd })
     }
 
     /// Build from parts — used by tests and by embedders of the library.
     pub fn from_parts(paths: Paths, config: Config, store: Arc<dyn Storage>, cwd: PathBuf) -> Self {
         let embedder = crate::embeddings::build(&config.embeddings).unwrap_or(None);
-        Self { paths, config, store, embedder, cwd }
+        let vector = crate::search::vector::build(&config.vector, Arc::clone(&store))
+            .unwrap_or_else(|_| {
+                Arc::new(crate::search::vector::sqlite::SqliteVectorIndex::new(Arc::clone(&store)))
+            });
+        Self { paths, config, store, embedder, vector, cwd }
+    }
+
+    /// The configured vector index.
+    pub fn vector(&self) -> &dyn VectorIndex {
+        self.vector.as_ref()
+    }
+
+    /// Replace the vector index (tests, or a command that overrides it).
+    pub fn set_vector(&mut self, vector: Arc<dyn VectorIndex>) {
+        self.vector = vector;
     }
 
     /// The configured embedding provider, if embeddings are enabled.

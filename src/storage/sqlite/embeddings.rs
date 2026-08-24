@@ -112,17 +112,23 @@ impl EmbeddingRepository for SqliteStore {
         let conn = self.conn();
         let mut out = Vec::new();
         for kind in wanted {
-            let table = match kind {
-                RecordKind::Memory => "memories",
-                RecordKind::Decision => "architecture_decisions",
-                RecordKind::Checkpoint => "checkpoints",
+            // Each kind reports its lifecycle on the memory scale, so callers
+            // (and any external index) can filter uniformly.
+            let (table, status_expr) = match kind {
+                RecordKind::Memory => ("memories", "t.status"),
+                RecordKind::Decision => (
+                    "architecture_decisions",
+                    "CASE WHEN t.status IN ('accepted', 'proposed') THEN 'active' \
+                     ELSE 'superseded' END",
+                ),
+                RecordKind::Checkpoint => ("checkpoints", "'active'"),
             };
             // Archived memories are excluded here rather than at ranking time:
             // they should not consume candidate slots at all.
             let extra = if kind == RecordKind::Memory { "AND t.status != 'archived'" } else { "" };
             let (scope_sql, param) = scope.sql("t.project_id");
             let sql = format!(
-                "SELECT e.record_id, t.project_id, e.vector
+                "SELECT e.record_id, t.project_id, e.vector, {status_expr}
                    FROM embeddings e JOIN {table} t ON t.id = e.record_id
                   WHERE e.record_kind = ?1 AND {scope_sql} {extra}"
             );
@@ -132,6 +138,10 @@ impl EmbeddingRepository for SqliteStore {
                     record: RecordRef::new(kind, row.get::<_, String>(0)?),
                     project_id: row.get(1)?,
                     vector: decode_vector(&row.get::<_, Vec<u8>>(2)?),
+                    status: row
+                        .get::<_, String>(3)?
+                        .parse()
+                        .unwrap_or(crate::core::model::Status::Active),
                 })
             };
             let rows = match param {

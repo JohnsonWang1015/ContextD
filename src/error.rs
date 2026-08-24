@@ -39,6 +39,9 @@ pub enum Error {
     #[error("embedding provider `{0}` is not configured correctly: {1}")]
     EmbeddingProvider(String, String),
 
+    #[error("vector store `{0}`: {1}")]
+    VectorStore(String, String),
+
     #[error(
         "refusing to overwrite {path}: it was modified outside ContextD (use --force to override)"
     )]

@@ -207,10 +207,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Attach(args) => commands::project::attach(&app, global, &args),
         Command::Detach(args) => commands::project::detach(&app, global, &args),
         Command::List(args) => commands::project::list(&app, global, &args),
-        Command::Status(args) => commands::project::status(&app, global, &args),
+        Command::Status(args) => commands::project::status(&app, global, &args).await,
         Command::Add(args) => commands::memory::add(&app, global, &args).await,
         Command::Edit(args) => commands::memory::edit(&app, global, &args).await,
-        Command::Delete(args) => commands::memory::delete(&app, global, &args),
+        Command::Delete(args) => commands::memory::delete(&app, global, &args).await,
         Command::Show(args) => commands::memory::show(&app, global, &args),
         Command::Memories(args) => commands::memory::list(&app, global, &args),
         Command::Supersede(args) => commands::memory::supersede(&app, global, &args),
@@ -226,7 +226,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Import(args) => commands::agent::import(&app, global, &args),
         Command::Export(args) => commands::agent::export(&app, global, &args).await,
         Command::Mcp(command) => commands::mcp::run(&app, global, command).await,
-        Command::Config(args) => commands::config::run(&app, global, &args),
+        Command::Config(args) => commands::config::run(&app, global, &args).await,
     }
 }
 

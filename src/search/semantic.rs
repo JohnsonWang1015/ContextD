@@ -1,24 +1,23 @@
 //! Semantic retrieval arm.
 //!
-//! Brute-force cosine over the vectors in scope. At ContextD's scale (a
-//! personal memory store) this is a sub-millisecond scan and needs no index to
-//! keep in sync; the [`crate::storage::repository::EmbeddingRepository`] trait
-//! is where an ANN backend would slot in if a store ever grew large enough to
-//! need one.
+//! The arm itself is backend-agnostic: it embeds the query and hands the
+//! vector to whichever [`VectorIndex`] is configured — the built-in SQLite
+//! scan, or Qdrant for a store that has outgrown one.
 
 use std::collections::HashMap;
 
 use crate::core::model::{RecordKind, RecordRef};
-use crate::embeddings::{cosine_similarity, provider::embed_one, EmbeddingProvider};
+use crate::embeddings::{provider::embed_one, EmbeddingProvider};
 use crate::error::Result;
-use crate::storage::repository::{EmbeddingRepository, ProjectScope};
+use crate::search::vector::{VectorIndex, VectorQuery};
+use crate::storage::repository::ProjectScope;
 
 /// Run the semantic arm, returning `record -> similarity` in 0.0..=1.0.
 ///
-/// Cosine ranges over -1..=1; it is rescaled so it can be summed with the
-/// lexical score, and negatives (actively dissimilar) collapse to 0.
+/// Cosine ranges over -1..=1; negatives (actively dissimilar) collapse to 0 so
+/// the score can be summed with the lexical one.
 pub async fn candidates(
-    store: &dyn EmbeddingRepository,
+    index: &dyn VectorIndex,
     provider: &dyn EmbeddingProvider,
     query: &str,
     scope: &ProjectScope,
@@ -28,28 +27,22 @@ pub async fn candidates(
     if query.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    let records = store.embedded_records(scope, kinds)?;
-    if records.is_empty() {
-        return Ok(HashMap::new());
-    }
 
     let query_vector = embed_one(provider, query).await?;
     if query_vector.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut scored: Vec<(RecordRef, f64)> = records
-        .into_iter()
-        .map(|record| {
-            let similarity = cosine_similarity(&query_vector, &record.vector);
-            (record.record, similarity.max(0.0))
+    let matches = index
+        .search(&VectorQuery {
+            vector: query_vector,
+            scope: scope.clone(),
+            kinds: kinds.to_vec(),
+            limit,
         })
-        .filter(|(_, similarity)| *similarity > 0.0)
-        .collect();
+        .await?;
 
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored.truncate(limit);
-    Ok(scored.into_iter().collect())
+    Ok(matches.into_iter().map(|hit| (hit.record, hit.score)).collect())
 }
 
 #[cfg(test)]
@@ -57,13 +50,13 @@ mod tests {
     use super::*;
     use crate::core::model::{Category, EmbeddingRecord, Memory, Project};
     use crate::embeddings::local::LocalEmbedder;
-    use crate::storage::repository::{MemoryRepository, ProjectRepository};
     use crate::storage::SqliteStore;
     use crate::util::hash::content_hash;
     use crate::util::time;
 
-    fn seed() -> (SqliteStore, Project, LocalEmbedder) {
-        let store = SqliteStore::open_in_memory().unwrap();
+    fn seed() -> (std::sync::Arc<dyn crate::storage::repository::Storage>, Project, LocalEmbedder) {
+        let store: std::sync::Arc<dyn crate::storage::repository::Storage> =
+            std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
         let project = Project {
             id: crate::util::ids::new_id(),
             name: "P".into(),
@@ -80,7 +73,18 @@ mod tests {
         (store, project, LocalEmbedder::new(256))
     }
 
-    fn add(store: &SqliteStore, project: &Project, embedder: &LocalEmbedder, text: &str) -> String {
+    fn index(
+        store: &std::sync::Arc<dyn crate::storage::repository::Storage>,
+    ) -> crate::search::vector::sqlite::SqliteVectorIndex {
+        crate::search::vector::sqlite::SqliteVectorIndex::new(std::sync::Arc::clone(store))
+    }
+
+    fn add(
+        store: &std::sync::Arc<dyn crate::storage::repository::Storage>,
+        project: &Project,
+        embedder: &LocalEmbedder,
+        text: &str,
+    ) -> String {
         let mut memory = Memory::new(Category::Architecture, text, text);
         memory.project_id = Some(project.id.clone());
         store.create_memory(&memory).unwrap();
@@ -112,7 +116,7 @@ mod tests {
         let unrelated = add(&store, &project, &embedder, "The CLI prints a colourful table");
 
         let hits = candidates(
-            &store,
+            &index(&store),
             &embedder,
             "which message transport does the scheduler use",
             &ProjectScope::Any,
@@ -130,11 +134,11 @@ mod tests {
     #[tokio::test]
     async fn empty_inputs_are_handled() {
         let (store, _project, embedder) = seed();
-        assert!(candidates(&store, &embedder, "  ", &ProjectScope::Any, &[], 10)
+        assert!(candidates(&index(&store), &embedder, "  ", &ProjectScope::Any, &[], 10)
             .await
             .unwrap()
             .is_empty());
-        assert!(candidates(&store, &embedder, "anything", &ProjectScope::Any, &[], 10)
+        assert!(candidates(&index(&store), &embedder, "anything", &ProjectScope::Any, &[], 10)
             .await
             .unwrap()
             .is_empty());
@@ -146,8 +150,9 @@ mod tests {
         for i in 0..5 {
             add(&store, &project, &embedder, &format!("scheduler note number {i}"));
         }
-        let hits =
-            candidates(&store, &embedder, "scheduler", &ProjectScope::Any, &[], 2).await.unwrap();
+        let hits = candidates(&index(&store), &embedder, "scheduler", &ProjectScope::Any, &[], 2)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 2);
     }
 }

@@ -170,7 +170,7 @@ pub async fn call(
         "semantic_recall" => semantic_recall(app, default_project, arguments).await,
         "memory_get" => memory_get(app, arguments),
         "project_context" => project_context(app, default_project, arguments).await,
-        "project_status" => project_status(app, default_project, arguments),
+        "project_status" => project_status(app, default_project, arguments).await,
         "checkpoint_latest" => checkpoint_latest(app, default_project, arguments),
         "architecture_decisions" => architecture_decisions(app, default_project, arguments),
         "memory_add" => memory_add(app, default_project, arguments).await,
@@ -285,9 +285,13 @@ async fn project_context(
     Ok(ToolResult::text(markdown, Some(structured)))
 }
 
-fn project_status(app: &App, default_project: Option<&str>, args: &Value) -> Result<ToolResult> {
+async fn project_status(
+    app: &App,
+    default_project: Option<&str>,
+    args: &Value,
+) -> Result<ToolResult> {
     let project = resolve_project(app, default_project, args)?;
-    let report = ProjectService::new(app).status(project.as_ref())?;
+    let report = ProjectService::new(app).status(project.as_ref()).await?;
     let name = report.project.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "—".into());
     let text = format!(
         "{name}: {} memories ({} superseded), {} decisions, {} checkpoints\nbranch: {}\nlast checkpoint: {}",
@@ -310,6 +314,7 @@ fn project_status(app: &App, default_project: Option<&str>, args: &Value) -> Res
         "dirty_files": report.git.dirty_files.len(),
         "embedded": {"current": report.embedded.0, "total": report.embedded.1},
         "embedding_provider": report.embedding_provider,
+        "vector_store": report.vector,
     });
     Ok(ToolResult::text(text, Some(structured)))
 }

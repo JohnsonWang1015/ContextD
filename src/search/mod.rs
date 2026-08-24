@@ -10,6 +10,7 @@ pub mod hybrid;
 pub mod indexer;
 pub mod scoring;
 pub mod semantic;
+pub mod vector;
 
 pub use hybrid::{SearchHit, SearchMode, SearchRequest, SearchService};
 pub use indexer::{IndexReport, IndexService};

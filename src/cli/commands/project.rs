@@ -299,9 +299,9 @@ pub fn list(app: &App, global: &GlobalArgs, args: &ListArgs) -> Result<()> {
 }
 
 /// Show project status.
-pub fn status(app: &App, global: &GlobalArgs, _args: &StatusArgs) -> Result<()> {
+pub async fn status(app: &App, global: &GlobalArgs, _args: &StatusArgs) -> Result<()> {
     let project = app.resolve_project(global.project.as_deref())?;
-    let report = ProjectService::new(app).status(project.as_ref())?;
+    let report = ProjectService::new(app).status(project.as_ref()).await?;
 
     #[derive(Serialize)]
     struct StatusOutput {
@@ -312,6 +312,7 @@ pub fn status(app: &App, global: &GlobalArgs, _args: &StatusArgs) -> Result<()> 
         dirty_files: usize,
         embedded: (usize, usize),
         embedding_provider: String,
+        vector: crate::search::vector::VectorHealth,
         latest_checkpoint: Option<crate::core::model::Checkpoint>,
         agents: Vec<String>,
     }
@@ -324,6 +325,7 @@ pub fn status(app: &App, global: &GlobalArgs, _args: &StatusArgs) -> Result<()> 
         dirty_files: report.git.dirty_files.len(),
         embedded: report.embedded,
         embedding_provider: report.embedding_provider.clone(),
+        vector: report.vector.clone(),
         latest_checkpoint: report.latest_checkpoint.clone(),
         agents: report.bindings.iter().map(|b| b.agent.clone()).collect(),
     };
@@ -403,10 +405,37 @@ fn render_status(report: &StatusReport) -> String {
         agents
     };
 
+    // An external store is worth a line of its own: when Qdrant is down,
+    // recall silently degrades to keyword search, and that must be visible.
+    let vector_state = if !report.vector.is_external_backend() {
+        ui::dim("sqlite (built in)")
+    } else if report.vector.reachable {
+        format!(
+            "{} {}",
+            ui::check(true),
+            ui::dim(&format!(
+                "{}{}",
+                report.vector.backend,
+                report.vector.points.map(|n| format!(" · {n} points")).unwrap_or_default()
+            ))
+        )
+    } else {
+        format!(
+            "{} {}",
+            ui::red("✗"),
+            ui::dim(&format!(
+                "{} unreachable — recall is keyword-only{}",
+                report.vector.backend,
+                report.vector.detail.as_ref().map(|d| format!(" ({d})")).unwrap_or_default()
+            ))
+        )
+    };
+
     text.push_str(&format!(
         "\n{}\n",
         ui::kv(&[
             ("Semantic index", format!("{index_state}  {}", ui::dim(&report.embedding_provider))),
+            ("Vector store", vector_state),
             ("Agents", if agents.is_empty() { ui::dim("none bound") } else { agents.join(", ") }),
             ("MCP", format!("{} {}", ui::check(true), ui::dim("contextd mcp serve"))),
         ])

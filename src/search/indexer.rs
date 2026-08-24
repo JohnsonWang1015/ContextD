@@ -6,8 +6,9 @@
 //! That keeps `contextd refresh` cheap and, with a paid provider, inexpensive.
 
 use crate::app::App;
-use crate::core::model::EmbeddingRecord;
+use crate::core::model::{EmbeddingRecord, RecordRef, Status};
 use crate::error::Result;
+use crate::search::vector::{VectorHealth, VectorPoint};
 use crate::storage::repository::ProjectScope;
 use crate::util::hash::content_hash;
 use crate::util::time;
@@ -18,6 +19,8 @@ pub struct IndexReport {
     pub embedded: usize,
     pub skipped: usize,
     pub fts_records: usize,
+    /// Points written to an external vector index, if one is configured.
+    pub indexed: usize,
     /// Set when embeddings are configured off, or the provider failed.
     pub note: Option<String>,
 }
@@ -74,23 +77,38 @@ impl<'a> IndexService<'a> {
         }
 
         let mut embedded = 0;
+        let mut points = Vec::with_capacity(pending.len());
         for (record, vector) in pending.iter().zip(vectors) {
             if vector.is_empty() {
                 continue; // nothing to index for an empty record
             }
+            // SQLite keeps the authoritative copy whatever the search backend
+            // is, so an external index can always be rebuilt from it.
             store.upsert_embedding(&EmbeddingRecord {
                 owner: record.record.clone(),
                 provider: provider.id().to_string(),
                 model: provider.model().to_string(),
                 dimensions: vector.len(),
-                vector,
+                vector: vector.clone(),
                 content_hash: content_hash(&record.embed_text()),
                 created_at: time::now(),
             })?;
+            points.push(VectorPoint {
+                record: record.record.clone(),
+                project_id: record.project_id.clone(),
+                status: self.status_of(&record.record),
+                vector,
+            });
             embedded += 1;
         }
 
-        Ok(IndexReport { embedded, skipped: pending.len() - embedded, ..Default::default() })
+        let indexed = self.publish(&points).await?;
+        Ok(IndexReport {
+            embedded,
+            skipped: pending.len() - embedded,
+            indexed,
+            ..Default::default()
+        })
     }
 
     /// Embed one record, best effort.
@@ -117,11 +135,101 @@ impl<'a> IndexService<'a> {
             provider: provider.id().to_string(),
             model: provider.model().to_string(),
             dimensions: vector.len(),
-            vector,
+            vector: vector.clone(),
             content_hash: content_hash(&text),
             created_at: time::now(),
         })?;
+        self.publish(&[VectorPoint {
+            record: record.clone(),
+            project_id: indexable.project_id.clone(),
+            status: self.status_of(record),
+            vector,
+        }])
+        .await?;
         Ok(true)
+    }
+
+    /// Push points to an external index. With the built-in backend this is a
+    /// no-op, because the SQLite table it searches has just been written.
+    async fn publish(&self, points: &[VectorPoint]) -> Result<usize> {
+        if points.is_empty() || !self.app.vector().is_external() {
+            return Ok(0);
+        }
+        self.app.vector().upsert(points).await?;
+        Ok(points.len())
+    }
+
+    /// Remove a record from the vector index.
+    ///
+    /// The SQLite row goes with the record itself (foreign keys see to that);
+    /// an external index has to be told.
+    pub async fn forget_record(&self, record: &RecordRef) -> Result<()> {
+        if !self.app.vector().is_external() {
+            return Ok(());
+        }
+        self.app.vector().delete(std::slice::from_ref(record)).await
+    }
+
+    /// Re-publish every stored vector to the configured index.
+    ///
+    /// This is the command to run after switching backend or embedding model:
+    /// it moves what is already in SQLite into the new index without paying to
+    /// embed anything again.
+    pub async fn reindex_vectors(&self) -> Result<usize> {
+        if !self.app.vector().is_external() {
+            return Ok(0);
+        }
+        let points: Vec<VectorPoint> = self
+            .app
+            .store()
+            .embedded_records(&ProjectScope::Any, &[])?
+            .into_iter()
+            .map(|record| VectorPoint {
+                record: record.record,
+                project_id: record.project_id,
+                status: record.status,
+                vector: record.vector,
+            })
+            .filter(|point| !point.vector.is_empty())
+            .collect();
+
+        self.app.vector().upsert(&points).await?;
+        Ok(points.len())
+    }
+
+    /// Lifecycle of a record, for the index payload.
+    fn status_of(&self, record: &RecordRef) -> Status {
+        match record.kind {
+            crate::core::model::RecordKind::Memory => self
+                .app
+                .store()
+                .get_memory(&record.id)
+                .ok()
+                .flatten()
+                .map(|memory| memory.status)
+                .unwrap_or(Status::Active),
+            crate::core::model::RecordKind::Decision => {
+                self.app
+                    .store()
+                    .get_decision(&record.id)
+                    .ok()
+                    .flatten()
+                    .map(|decision| {
+                        if decision.status.is_current() {
+                            Status::Active
+                        } else {
+                            Status::Superseded
+                        }
+                    })
+                    .unwrap_or(Status::Active)
+            }
+            crate::core::model::RecordKind::Checkpoint => Status::Active,
+        }
+    }
+
+    /// Health of the configured vector backend.
+    pub async fn vector_health(&self) -> Result<VectorHealth> {
+        self.app.vector().health().await
     }
 
     /// How many records in scope have a current vector, out of how many exist.
@@ -202,6 +310,94 @@ mod tests {
         assert_eq!(report.embedded, 0);
         assert!(report.note.is_some());
         assert_eq!(IndexService::new(&app).coverage(&ProjectScope::Any).unwrap(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn points_reach_an_external_index() {
+        use crate::search::vector::{VectorIndex, VectorMatch, VectorQuery};
+        use std::sync::{Arc, Mutex};
+
+        /// Stands in for Qdrant: records what it was told, nothing more.
+        #[derive(Default)]
+        struct RecordingIndex {
+            points: Mutex<Vec<VectorPoint>>,
+            deleted: Mutex<Vec<RecordRef>>,
+        }
+
+        impl VectorIndex for RecordingIndex {
+            fn backend(&self) -> &str {
+                "recording"
+            }
+            fn is_external(&self) -> bool {
+                true
+            }
+            fn upsert<'a>(
+                &'a self,
+                points: &'a [VectorPoint],
+            ) -> crate::embeddings::provider::BoxFuture<'a, Result<()>> {
+                Box::pin(async move {
+                    self.points.lock().unwrap().extend_from_slice(points);
+                    Ok(())
+                })
+            }
+            fn delete<'a>(
+                &'a self,
+                records: &'a [RecordRef],
+            ) -> crate::embeddings::provider::BoxFuture<'a, Result<()>> {
+                Box::pin(async move {
+                    self.deleted.lock().unwrap().extend_from_slice(records);
+                    Ok(())
+                })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a VectorQuery,
+            ) -> crate::embeddings::provider::BoxFuture<'a, Result<Vec<VectorMatch>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn clear(&self) -> crate::embeddings::provider::BoxFuture<'_, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn health(
+                &self,
+            ) -> crate::embeddings::provider::BoxFuture<
+                '_,
+                Result<crate::search::vector::VectorHealth>,
+            > {
+                Box::pin(async {
+                    Ok(crate::search::vector::VectorHealth {
+                        backend: "recording".into(),
+                        reachable: true,
+                        points: None,
+                        detail: None,
+                    })
+                })
+            }
+        }
+
+        let (_dir, mut app, project) = fixture().await;
+        let index = Arc::new(RecordingIndex::default());
+        app.set_vector(Arc::clone(&index) as Arc<dyn VectorIndex>);
+
+        let memory = MemoryService::new(&app)
+            .add(NewMemory {
+                project: Some(project.clone()),
+                ..NewMemory::new(Category::Architecture, "scheduler uses NATS")
+            })
+            .unwrap();
+
+        let indexer = IndexService::new(&app);
+        let report = indexer.embed_pending(&ProjectScope::Any, false).await.unwrap();
+        assert_eq!(report.embedded, 1);
+        assert_eq!(report.indexed, 1, "the external index must be told about new vectors");
+        assert_eq!(index.points.lock().unwrap()[0].status, Status::Active);
+        assert!(!index.points.lock().unwrap()[0].vector.is_empty());
+
+        // Rebuilding pushes what SQLite already holds, without re-embedding.
+        assert_eq!(indexer.reindex_vectors().await.unwrap(), 1);
+
+        indexer.forget_record(&RecordRef::memory(&memory.id)).await.unwrap();
+        assert_eq!(index.deleted.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

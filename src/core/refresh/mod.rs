@@ -77,6 +77,12 @@ pub struct RefreshReport {
     pub embedded: usize,
     pub summaries: Vec<String>,
     pub notes: Vec<String>,
+    /// Why the semantic index could not be rebuilt, if it could not be.
+    ///
+    /// The memory tidying above it has already been committed; this is
+    /// reported separately so the caller can fail the command without
+    /// pretending the whole pass was wasted.
+    pub index_error: Option<String>,
     pub dry_run: bool,
 }
 
@@ -156,9 +162,9 @@ impl<'a> RefreshService<'a> {
                     report.embedded = index_report.embedded;
                     report.notes.extend(index_report.note);
                 }
-                // A refresh that tidied memories should not be reported as a
-                // failure because an embedding endpoint was unreachable.
-                Err(err) => report.notes.push(format!("embedding pass failed: {err}")),
+                // The memories were tidied either way, so that work stands;
+                // the caller still learns that the index is now stale.
+                Err(err) => report.index_error = Some(err.to_string()),
             }
         }
 

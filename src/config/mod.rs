@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 pub struct Config {
     pub general: General,
     pub embeddings: EmbeddingConfig,
+    pub vector: VectorConfig,
     pub search: SearchConfig,
     pub context: ContextConfig,
     pub refresh: RefreshConfig,
@@ -81,6 +82,51 @@ impl Default for EmbeddingConfig {
             timeout_secs: 30,
             batch_size: 32,
         }
+    }
+}
+
+/// Where vectors are indexed for similarity search.
+///
+/// SQLite is the default and needs nothing installed: a brute-force cosine
+/// scan over the stored vectors, which is sub-millisecond for a personal
+/// store. Qdrant is for people who already run one, or whose memory has grown
+/// past what a scan should handle.
+///
+/// Either way SQLite remains the authoritative copy of every vector, so the
+/// external index can always be rebuilt and `contextd bundle` keeps working.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct VectorConfig {
+    /// `sqlite` (default) or `qdrant`.
+    pub backend: String,
+    /// Base URL of the Qdrant REST API.
+    pub url: String,
+    /// Collection name; created on first use if missing.
+    pub collection: String,
+    /// Environment variable holding the Qdrant API key, when one is needed.
+    pub api_key_env: String,
+    pub timeout_secs: u64,
+    /// Points sent per upsert request.
+    pub batch_size: usize,
+}
+
+impl Default for VectorConfig {
+    fn default() -> Self {
+        Self {
+            backend: "sqlite".into(),
+            url: "http://localhost:6333".into(),
+            collection: "contextd".into(),
+            api_key_env: "QDRANT_API_KEY".into(),
+            timeout_secs: 15,
+            batch_size: 64,
+        }
+    }
+}
+
+impl VectorConfig {
+    /// Whether an external service is in play.
+    pub fn is_external(&self) -> bool {
+        !matches!(self.backend.trim().to_lowercase().as_str(), "sqlite" | "" | "none")
     }
 }
 
@@ -298,6 +344,12 @@ impl Config {
                 "must not exceed refresh.duplicate_threshold",
             ));
         }
+        if self.vector.is_external() && self.vector.url.trim().is_empty() {
+            return Err(Error::invalid("vector.url", "must not be empty for an external backend"));
+        }
+        if self.vector.is_external() && self.vector.collection.trim().is_empty() {
+            return Err(Error::invalid("vector.collection", "must not be empty"));
+        }
         for remote in &self.remotes {
             remote.validate()?;
         }
@@ -332,6 +384,30 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.context.max_context_tokens, 100);
         assert_eq!(cfg.embeddings.provider, "local");
+    }
+
+    #[test]
+    fn vector_backend_defaults_to_sqlite() {
+        let config = VectorConfig::default();
+        assert!(!config.is_external());
+        assert!(VectorConfig { backend: "qdrant".into(), ..VectorConfig::default() }.is_external());
+    }
+
+    #[test]
+    fn external_vector_backend_needs_a_url_and_collection() {
+        let mut config = Config {
+            vector: VectorConfig {
+                backend: "qdrant".into(),
+                url: "  ".into(),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+        config.vector.url = "http://localhost:6333".into();
+        assert!(config.validate().is_ok());
+        config.vector.collection = String::new();
+        assert!(config.validate().is_err());
     }
 
     #[test]

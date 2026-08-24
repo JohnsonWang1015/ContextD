@@ -44,6 +44,8 @@ pub struct StatusReport {
     /// Records with a current vector, and the total that could have one.
     pub embedded: (usize, usize),
     pub embedding_provider: String,
+    /// Backend the vectors are searched in, and whether it answers.
+    pub vector: crate::search::vector::VectorHealth,
 }
 
 /// Project operations.
@@ -164,7 +166,10 @@ impl<'a> ProjectService<'a> {
     }
 
     /// Everything `contextd status` needs.
-    pub fn status(&self, project: Option<&Project>) -> Result<StatusReport> {
+    ///
+    /// An external vector backend is contacted here, which is why this is
+    /// async: a status line saying "Qdrant ✓" has to have asked Qdrant.
+    pub async fn status(&self, project: Option<&Project>) -> Result<StatusReport> {
         let store = self.app.store();
         let (stats, latest_checkpoint, bindings) = match project {
             Some(p) => (
@@ -185,6 +190,8 @@ impl<'a> ProjectService<'a> {
             None => "disabled".to_string(),
         };
 
+        let vector = crate::search::IndexService::new(self.app).vector_health().await?;
+
         Ok(StatusReport {
             project: project.cloned(),
             stats,
@@ -196,6 +203,7 @@ impl<'a> ProjectService<'a> {
             bindings,
             embedded,
             embedding_provider: provider,
+            vector,
         })
     }
 
@@ -400,12 +408,14 @@ mod tests {
         assert!(app.store().get_project(&project.id).unwrap().is_none());
     }
 
-    #[test]
-    fn status_without_project_is_empty_but_valid() {
+    #[tokio::test]
+    async fn status_without_project_is_empty_but_valid() {
         let dir = tempfile::tempdir().unwrap();
         let app = app_in(dir.path());
-        let report = ProjectService::new(&app).status(None).unwrap();
+        let report = ProjectService::new(&app).status(None).await.unwrap();
         assert!(report.project.is_none());
         assert_eq!(report.stats.memories, 0);
+        assert_eq!(report.vector.backend, "sqlite");
+        assert!(report.vector.reachable);
     }
 }
