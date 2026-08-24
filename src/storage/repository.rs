@@ -199,6 +199,11 @@ pub trait MemoryRepository {
     fn supersede_memory(&self, old_id: &str, new_id: &str) -> Result<()>;
     fn get_memories(&self, ids: &[String]) -> Result<Vec<Memory>>;
     fn all_tags(&self, scope: &ProjectScope) -> Result<Vec<(String, usize)>>;
+    /// How many *current* memories of each category are in scope, busiest
+    /// first. Superseded and archived memories are history and are counted
+    /// elsewhere; a breakdown of what a store knows should describe what it
+    /// currently believes.
+    fn category_counts(&self, scope: &ProjectScope) -> Result<Vec<(Category, usize)>>;
 }
 
 /// Checkpoints.

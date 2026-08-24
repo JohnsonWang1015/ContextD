@@ -25,6 +25,7 @@ use serde::Serialize;
 
 use crate::app::App;
 use crate::config::RemoteConfig;
+use crate::core::inventory::Inventory;
 use crate::error::{Error, Result};
 use crate::sync::bundle::{self, Bundle, BundleOptions, MergeReport};
 
@@ -154,6 +155,27 @@ impl<'a> RemoteSync<'a> {
         Self { app }
     }
 
+    /// Survey a machine without taking anything from it.
+    ///
+    /// The remote reports counts, not content, so finding out what an account
+    /// holds costs a few kilobytes instead of its whole memory. It is also the
+    /// step that says plainly whether ContextD is installed over there and
+    /// where its home turned out to be, which is what makes `pull` predictable.
+    pub fn scan(&self, transport: &dyn RemoteTransport) -> Result<Inventory> {
+        let stdout = transport
+            .run(&["inventory".to_string(), "--json".to_string()], None)
+            .map_err(|err| explain_remote_failure(transport, err))?;
+
+        Inventory::from_json(stdout.trim()).map_err(|err| {
+            Error::Other(anyhow::anyhow!(
+                "{} did not return an inventory ({err}). Older builds do not have \
+                 `contextd inventory`; upgrade contextd there, or use \
+                 `contextd remote pull <name> --dry-run` instead.",
+                transport.describe()
+            ))
+        })
+    }
+
     /// Fetch the remote's memory and merge it into this machine.
     pub fn pull(
         &self,
@@ -173,7 +195,8 @@ impl<'a> RemoteSync<'a> {
             args.push("--no-checkpoints".to_string());
         }
 
-        let stdout = transport.run(&args, None)?;
+        let stdout =
+            transport.run(&args, None).map_err(|err| explain_remote_failure(transport, err))?;
         let bundle = Bundle::from_json(stdout.trim()).map_err(|err| {
             Error::Other(anyhow::anyhow!(
                 "{} did not return a bundle ({err}); is contextd installed there?",
@@ -236,6 +259,22 @@ impl<'a> RemoteSync<'a> {
     }
 }
 
+/// Turn a transport failure into something the user can act on.
+///
+/// The two failures worth naming are "no contextd over there" and "cannot get
+/// there at all"; everything else is passed through as ssh reported it.
+fn explain_remote_failure(transport: &dyn RemoteTransport, err: Error) -> Error {
+    let text = err.to_string();
+    if text.contains("command not found") || text.contains("No such file or directory") {
+        return Error::Other(anyhow::anyhow!(
+            "contextd is not on the PATH for {}. Install it there, or point at it with \
+             `contextd remote add <name> <host> --command /path/to/contextd`.",
+            transport.describe()
+        ));
+    }
+    err
+}
+
 /// Look up a remote by name and build its transport.
 pub fn transport_for(app: &App, name: &str) -> Result<SshTransport> {
     let config = app.config().remote(name).cloned().ok_or_else(|| {
@@ -289,6 +328,7 @@ mod tests {
         fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String> {
             self.calls.lock().unwrap().push(args.to_vec());
             match args.first().map(String::as_str) {
+                Some("inventory") => crate::core::inventory::collect(&self.peer)?.to_json(),
                 Some("bundle") => match args.get(1).map(String::as_str) {
                     Some("export") => {
                         bundle::build(&self.peer, &BundleOptions::everything())?.to_json()
@@ -421,6 +461,65 @@ mod tests {
         assert_eq!(report.merge.memories_added, 1);
         assert!(report.merge.dry_run);
         assert!(local.store().list_memories(&Default::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_reports_what_the_other_machine_holds() {
+        let url = "git@github.com:acme/FerroGrid.git";
+        let (_lab_dir, lab, lab_project) = machine("FerroGrid", url);
+        add(&lab, &lab_project, "Lab box measured heartbeat latency at 4ms");
+        add(&lab, &lab_project, "GPU nodes are bare metal");
+
+        let (_local_dir, local, _) = machine("FerroGrid", url);
+        let transport = LoopbackTransport::new(lab.clone());
+        let inventory = RemoteSync::new(&local).scan(&transport).unwrap();
+
+        assert_eq!(inventory.totals.projects, 1);
+        assert_eq!(inventory.totals.memories, 2);
+        assert_eq!(inventory.projects[0].name, "FerroGrid");
+        assert!(inventory.last_activity().is_some());
+
+        // Surveying takes nothing: the local store is untouched.
+        assert!(local.store().list_memories(&Default::default()).unwrap().is_empty());
+        assert_eq!(transport.calls.lock().unwrap()[0], vec!["inventory", "--json"]);
+    }
+
+    #[test]
+    fn scanning_a_machine_without_contextd_says_so() {
+        struct Missing;
+        impl RemoteTransport for Missing {
+            fn describe(&self) -> String {
+                "lab (dev@lab-box)".into()
+            }
+            fn run(&self, _args: &[String], _stdin: Option<&str>) -> Result<String> {
+                Err(Error::Other(anyhow::anyhow!(
+                    "remote `lab` failed (exit status: 127): bash: contextd: command not found"
+                )))
+            }
+        }
+
+        let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
+        let err = RemoteSync::new(&local).scan(&Missing).unwrap_err().to_string();
+        assert!(err.contains("not on the PATH"), "{err}");
+        assert!(err.contains("--command"), "the fix must be in the message: {err}");
+    }
+
+    #[test]
+    fn scanning_an_older_build_explains_the_gap() {
+        struct OldBuild;
+        impl RemoteTransport for OldBuild {
+            fn describe(&self) -> String {
+                "lab".into()
+            }
+            fn run(&self, _args: &[String], _stdin: Option<&str>) -> Result<String> {
+                Ok("error: unrecognized subcommand 'inventory'".into())
+            }
+        }
+
+        let (_dir, local, _) = machine("FerroGrid", "git@github.com:acme/FerroGrid.git");
+        let err = RemoteSync::new(&local).scan(&OldBuild).unwrap_err().to_string();
+        assert!(err.contains("did not return an inventory"), "{err}");
+        assert!(err.contains("--dry-run"), "{err}");
     }
 
     #[test]

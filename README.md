@@ -105,6 +105,8 @@ MCP             ✓ contextd mcp serve
 | `sync` | Write the Markdown mirror and bound agent files |
 | `import` / `export <agent>` | Move context in and out of agent files |
 | `remote add/list/remove` | Machines to exchange memory with |
+| `remote scan` | Survey a machine: what it holds, without copying it |
+| `inventory` | The same survey of this machine |
 | `remote pull` / `remote push` | Sync memory over SSH, record by record |
 | `bundle export/import` | The same exchange as a JSON file |
 | `mcp serve` / `mcp tools` | Run the MCP server; list its tools |
@@ -149,11 +151,42 @@ Working on a laptop and a workstation used to mean two disjoint memories.
 ContextD exchanges *records*, not files:
 
 ```sh
+contextd remote scan dev@lab-box             # what does that account hold?
 contextd remote add lab dev@lab-box          # a Host alias from ~/.ssh/config works too
 contextd remote pull lab                     # bring their memory here
 contextd remote push lab                     # send yours there
 contextd remote pull lab --dry-run           # see what would change first
 ```
+
+`remote scan` surveys an account before you commit to anything. It reports
+counts, not content, so finding out what is on a machine costs a few kilobytes
+rather than its whole memory, and it works on a destination that is not a
+configured remote yet:
+
+```
+$ contextd remote scan lab
+lab-box contextd 0.1.0
+─────────────────────────────────
+Home           /home/dev/.contextd
+Memories       124 (118 current, 6 superseded)
+Decisions      18
+Checkpoints    7
+Last activity  2 hours ago
+Embeddings     openai · bge-m3 · vectors in qdrant
+
+project    mem  adr  ckpt  last activity  last checkpoint
+FerroGrid  80   12   5     2 hours ago    worker heartbeat completed
+Sable      38   6    2     3 weeks ago    parser rewrite landed
+
+plus 6 global memories, applying to every project: 4 convention, 2 user
+
+  Nothing was copied. `contextd remote pull lab` merges it here.
+```
+
+`--detail` adds a category breakdown per project. `contextd inventory` runs the
+same survey locally. The account is whichever one you SSH as, and the home is
+resolved on that machine (`$CONTEXTD_HOME`, else `~/.contextd`) — pass
+`--remote-home` if it lives somewhere else.
 
 `pull` runs `contextd bundle export` on the far side over SSH and merges what
 comes back. Merging is by UUID, so:

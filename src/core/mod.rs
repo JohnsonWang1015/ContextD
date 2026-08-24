@@ -6,6 +6,7 @@
 pub mod checkpoint;
 pub mod context;
 pub mod decision;
+pub mod inventory;
 pub mod memory;
 pub mod model;
 pub mod project;

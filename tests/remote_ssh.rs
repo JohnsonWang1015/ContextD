@@ -148,3 +148,113 @@ fn a_failing_remote_reports_the_ssh_error() {
     assert!(stderr.contains("remote `lab` failed"), "stderr: {stderr}");
     assert!(stderr.contains("No route to host"), "the ssh diagnosis must survive: {stderr}");
 }
+
+#[test]
+fn scanning_a_remote_reports_what_it_holds_without_copying_it() {
+    let binary = contextd_binary();
+
+    // The machine to be surveyed: two projects and a global memory.
+    let lab = Sandbox::new();
+    lab.run(&["init"]);
+    lab.run(&["attach", "--name", "FerroGrid"]);
+    lab.run(&["add", "-c", "architecture", "Scheduler transport is NATS"]);
+    lab.run(&["add", "-c", "architecture", "GPU nodes are bare metal"]);
+    lab.run(&["add", "-c", "convention", "Format with rustfmt"]);
+    lab.run(&["decision", "add", "Use NATS JetStream", "--title", "Task transport"]);
+    lab.run(&["checkpoint", "heartbeat done"]);
+    lab.run(&["add", "--global", "-c", "user", "Prefers small commits"]);
+
+    let laptop = Sandbox::new();
+    laptop.run(&["init"]);
+
+    let path_prefix = fake_ssh_dir(laptop.dir.path());
+    let with_fake_ssh = |args: &[&str]| -> String {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let output = laptop
+            .cmd()
+            .env("PATH", format!("{}:{existing}", path_prefix.display()))
+            .args(args)
+            .output()
+            .expect("spawn contextd");
+        assert!(
+            output.status.success(),
+            "`contextd {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // An unconfigured destination can be surveyed directly, before deciding
+    // whether it is worth keeping as a remote.
+    let raw = with_fake_ssh(&[
+        "remote",
+        "scan",
+        "dev@lab-box",
+        "--command",
+        binary.to_str().unwrap(),
+        "--remote-home",
+        lab.home().to_str().unwrap(),
+        "--json",
+    ]);
+    let inventory: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(inventory["totals"]["projects"], 1);
+    assert_eq!(inventory["totals"]["memories"], 4, "three project memories plus one global");
+    assert_eq!(inventory["totals"]["decisions"], 1);
+    assert_eq!(inventory["totals"]["checkpoints"], 1);
+    assert_eq!(inventory["projects"][0]["name"], "FerroGrid");
+    assert_eq!(inventory["projects"][0]["last_checkpoint"], "heartbeat done");
+    assert_eq!(inventory["global"]["memories"], 1);
+    assert_eq!(inventory["home"], lab.home().to_str().unwrap());
+
+    // Surveying copies nothing.
+    assert!(laptop.run_json(&["memories"]).as_array().unwrap().is_empty());
+    assert!(laptop.run_json(&["list"])["projects"].as_array().unwrap().is_empty());
+
+    // The same survey through a configured remote, in human form.
+    laptop.run(&[
+        "remote",
+        "add",
+        "lab",
+        "dev@lab-box",
+        "--command",
+        binary.to_str().unwrap(),
+        "--remote-home",
+        lab.home().to_str().unwrap(),
+    ]);
+    let text = with_fake_ssh(&["remote", "scan", "lab", "--detail"]);
+    assert!(text.contains("FerroGrid"), "{text}");
+    assert!(text.contains("Nothing was copied"), "{text}");
+    assert!(text.contains("architecture"), "--detail shows the breakdown: {text}");
+
+    // And the local equivalent describes this machine.
+    let local = laptop.run_json(&["inventory"]);
+    assert_eq!(local["totals"]["memories"], 0);
+}
+
+#[test]
+fn scanning_a_machine_without_contextd_explains_the_fix() {
+    let laptop = Sandbox::new();
+    laptop.bootstrap();
+
+    let bin = laptop.dir.path().join("nobin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("ssh");
+    std::fs::write(&script, "#!/bin/sh\necho 'bash: contextd: command not found' >&2\nexit 127\n")
+        .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    let output = laptop
+        .cmd()
+        .env("PATH", format!("{}:{existing}", bin.display()))
+        .args(["remote", "scan", "dev@lab-box"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not on the PATH"), "stderr: {stderr}");
+    assert!(stderr.contains("--command"), "stderr: {stderr}");
+}

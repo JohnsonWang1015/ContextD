@@ -265,6 +265,11 @@ impl MemoryRepository for SqliteStore {
         Ok(memories)
     }
 
+    fn category_counts(&self, scope: &ProjectScope) -> Result<Vec<(Category, usize)>> {
+        let conn = self.conn();
+        map_category_counts(&conn, scope)
+    }
+
     fn all_tags(&self, scope: &ProjectScope) -> Result<Vec<(String, usize)>> {
         let (scope_sql, param) = scope.sql("m.project_id");
         let sql = format!(
@@ -289,6 +294,24 @@ impl MemoryRepository for SqliteStore {
         };
         Ok(rows)
     }
+}
+
+fn map_category_counts(conn: &Connection, scope: &ProjectScope) -> Result<Vec<(Category, usize)>> {
+    let (scope_sql, param) = scope.sql("project_id");
+    let sql = format!(
+        "SELECT category, count(*) FROM memories
+          WHERE {scope_sql} AND status = 'active'
+          GROUP BY category ORDER BY count(*) DESC, category"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mapper = |row: &Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize));
+    let rows: Vec<(String, usize)> = match param {
+        Some(p) => stmt.query_map(params![p], mapper)?.collect::<rusqlite::Result<_>>()?,
+        None => stmt.query_map([], mapper)?.collect::<rusqlite::Result<_>>()?,
+    };
+    // An unrecognised category in the database is skipped rather than guessed:
+    // this is a summary, and a wrong label is worse than a missing one.
+    Ok(rows.into_iter().filter_map(|(name, count)| name.parse().ok().map(|c| (c, count))).collect())
 }
 
 fn load_tags(conn: &Connection, memory_id: &str) -> Result<Vec<String>> {
@@ -573,6 +596,36 @@ mod tests {
             .unwrap();
         assert_eq!(both.len(), 2);
         assert_eq!(store.count_memories(&MemoryFilter::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn category_counts_describe_current_knowledge() {
+        let (store, project) = store_with_project();
+        store.create_memory(&memory(&project, "A", "one")).unwrap();
+        store.create_memory(&memory(&project, "B", "two")).unwrap();
+        let mut superseded = memory(&project, "E", "five");
+        superseded.status = Status::Superseded;
+        store.create_memory(&superseded).unwrap();
+        let mut convention = Memory::new(Category::Convention, "C", "three");
+        convention.project_id = Some(project.id.clone());
+        store.create_memory(&convention).unwrap();
+        let mut archived = Memory::new(Category::Task, "D", "four");
+        archived.project_id = Some(project.id.clone());
+        archived.status = Status::Archived;
+        store.create_memory(&archived).unwrap();
+
+        let counts = store.category_counts(&ProjectScope::Project(project.id.clone())).unwrap();
+        assert_eq!(
+            counts[0],
+            (Category::Architecture, 2),
+            "busiest first, history excluded: {counts:?}"
+        );
+        assert!(counts.contains(&(Category::Convention, 1)));
+        assert!(
+            !counts.iter().any(|(category, _)| *category == Category::Task),
+            "archived memories are not part of the picture"
+        );
+        assert!(store.category_counts(&ProjectScope::GlobalOnly).unwrap().is_empty());
     }
 
     #[test]

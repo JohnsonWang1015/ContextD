@@ -15,11 +15,14 @@ use serde::Serialize;
 use crate::app::App;
 use crate::cli::{output, GlobalArgs};
 use crate::config::RemoteConfig;
+use crate::core::inventory::{self, Inventory};
 use crate::error::{Error, Result};
 use crate::search::IndexService;
 use crate::storage::repository::ProjectScope;
 use crate::sync::bundle::{self, Bundle, BundleOptions, MergeReport};
-use crate::sync::remote::{transport_for, RemoteSync, TransferOptions, TransferReport};
+use crate::sync::remote::{
+    transport_for, RemoteSync, SshTransport, TransferOptions, TransferReport,
+};
 use crate::ui;
 
 /// Machines ContextD can exchange memory with.
@@ -31,6 +34,8 @@ pub enum RemoteCommand {
     List,
     /// Forget a machine.
     Remove(RemoveRemoteArgs),
+    /// Survey a machine: what it holds, without taking anything.
+    Scan(ScanArgs),
     /// Fetch a machine's memory and merge it into this one.
     Pull(TransferArgs),
     /// Send this machine's memory to another and merge it there.
@@ -65,6 +70,28 @@ pub struct AddRemoteArgs {
 pub struct RemoveRemoteArgs {
     /// Name of the remote to forget.
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ScanArgs {
+    /// A configured remote, or an SSH destination such as `dev@lab-box`.
+    pub remote: String,
+
+    /// How to invoke ContextD there, when scanning an unconfigured host.
+    #[arg(long, default_value = "contextd")]
+    pub command: String,
+
+    /// CONTEXTD_HOME on that machine, when it is not the default.
+    #[arg(long = "remote-home", value_name = "PATH")]
+    pub remote_home: Option<String>,
+
+    /// Extra ssh arguments, e.g. --ssh-option=-p --ssh-option=2222.
+    #[arg(long = "ssh-option", value_name = "ARG")]
+    pub ssh_options: Vec<String>,
+
+    /// Show the category breakdown for every project.
+    #[arg(long)]
+    pub detail: bool,
 }
 
 #[derive(Debug, Args)]
@@ -140,12 +167,29 @@ pub struct BundleImportArgs {
     pub skip_embeddings: bool,
 }
 
+/// `contextd inventory`
+#[derive(Debug, Args)]
+pub struct InventoryArgs {
+    /// Show the category breakdown for every project.
+    #[arg(long)]
+    pub detail: bool,
+}
+
+/// Summarise the local store — the same survey `remote scan` runs over SSH.
+pub fn inventory(app: &App, global: &GlobalArgs, args: &InventoryArgs) -> Result<()> {
+    let inventory = inventory::collect(app)?;
+    output::render(global, &inventory, || {
+        render_inventory(&inventory, args.detail, "this machine", None)
+    })
+}
+
 /// Dispatch a `remote` subcommand.
 pub async fn run_remote(app: &App, global: &GlobalArgs, command: RemoteCommand) -> Result<()> {
     match command {
         RemoteCommand::Add(args) => add(app, global, &args),
         RemoteCommand::List => list(app, global),
         RemoteCommand::Remove(args) => remove(app, global, &args),
+        RemoteCommand::Scan(args) => scan(app, global, &args),
         RemoteCommand::Pull(args) => transfer(app, global, &args, Direction::Pull).await,
         RemoteCommand::Push(args) => transfer(app, global, &args, Direction::Push).await,
     }
@@ -236,6 +280,160 @@ fn remove(app: &App, global: &GlobalArgs, args: &RemoveRemoteArgs) -> Result<()>
     output::render(global, &Removed { removed: &args.name }, || {
         ui::ok(&format!("Removed remote {}.", args.name))
     })
+}
+
+/// Survey a machine without merging anything.
+fn scan(app: &App, global: &GlobalArgs, args: &ScanArgs) -> Result<()> {
+    // A name that is not configured is treated as an SSH destination, so a
+    // machine can be surveyed before deciding whether to keep it as a remote.
+    let (transport, known) = match transport_for(app, &args.remote) {
+        Ok(transport) => (transport, true),
+        Err(_) if looks_like_ssh_destination(&args.remote) => (
+            SshTransport::new(RemoteConfig {
+                name: args.remote.clone(),
+                host: args.remote.clone(),
+                command: args.command.clone(),
+                home: args.remote_home.clone(),
+                ssh_options: args.ssh_options.clone(),
+            })?,
+            false,
+        ),
+        Err(err) => return Err(err),
+    };
+
+    let inventory = RemoteSync::new(app).scan(&transport)?;
+    let next_step = if known {
+        format!("Nothing was copied. `contextd remote pull {}` merges it here.", args.remote)
+    } else {
+        format!(
+            "Nothing was copied. Keep it with `contextd remote add <name> {}`, then \
+             `contextd remote pull <name>`.",
+            args.remote
+        )
+    };
+    output::render(global, &inventory, || {
+        render_inventory(&inventory, args.detail, &args.remote, Some(next_step.as_str()))
+    })
+}
+
+/// `dev@lab-box`, `lab-box`, or a `~/.ssh/config` alias — anything that is not
+/// obviously a mistyped remote name.
+fn looks_like_ssh_destination(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.contains(char::is_whitespace)
+}
+
+/// Render a survey. `next_step` is the suggestion printed underneath, which a
+/// local inventory has no use for.
+fn render_inventory(
+    inventory: &Inventory,
+    detail: bool,
+    name: &str,
+    next_step: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "{}\n",
+        ui::header(&format!(
+            "{} {}",
+            inventory.host.clone().unwrap_or_else(|| name.to_string()),
+            ui::dim(&format!("contextd {}", inventory.version))
+        ))
+    );
+
+    text.push_str(&ui::kv(&[
+        ("Home", inventory.home.clone()),
+        (
+            "Memories",
+            format!(
+                "{} ({} current, {} superseded)",
+                inventory.totals.memories,
+                inventory.totals.active_memories,
+                inventory.totals.superseded_memories
+            ),
+        ),
+        ("Decisions", inventory.totals.decisions.to_string()),
+        ("Checkpoints", inventory.totals.checkpoints.to_string()),
+        ("Sessions", inventory.totals.sessions.to_string()),
+        (
+            "Last activity",
+            inventory
+                .last_activity()
+                .map(|when| crate::util::time::humanize_since(&when))
+                .unwrap_or_else(|| ui::dim("never").to_string()),
+        ),
+        (
+            "Embeddings",
+            format!("{} · vectors in {}", inventory.embeddings, inventory.vector_backend),
+        ),
+    ]));
+
+    if inventory.is_empty() {
+        text.push_str(&format!(
+            "\n\n{}",
+            ui::dim("That account has a ContextD home, but nothing recorded in it yet.")
+        ));
+        return text;
+    }
+
+    text.push_str("\n\n");
+    let rows: Vec<Vec<String>> = inventory
+        .projects
+        .iter()
+        .map(|project| {
+            vec![
+                project.name.clone(),
+                project.active_memories.to_string(),
+                project.decisions.to_string(),
+                project.checkpoints.to_string(),
+                project
+                    .last_activity
+                    .map(|when| crate::util::time::humanize_since(&when))
+                    .unwrap_or_default(),
+                ui::dim(&project.last_checkpoint.clone().unwrap_or_default()),
+            ]
+        })
+        .collect();
+    text.push_str(&ui::table(
+        &["project", "mem", "adr", "ckpt", "last activity", "last checkpoint"],
+        &rows,
+    ));
+
+    if inventory.global.memories > 0 {
+        text.push_str(&format!(
+            "\n\n{}",
+            ui::dim(&format!(
+                "plus {}, applying to every project: {}",
+                ui::plural(inventory.global.memories, "global memory", "global memories"),
+                summarise_categories(&inventory.global.categories)
+            ))
+        ));
+    }
+
+    if detail {
+        for project in &inventory.projects {
+            if project.categories.is_empty() {
+                continue;
+            }
+            text.push_str(&format!(
+                "\n{}\n  {}\n",
+                ui::bold(&project.name),
+                summarise_categories(&project.categories)
+            ));
+        }
+    }
+
+    if let Some(next_step) = next_step {
+        text.push_str(&format!("\n\n{}", ui::hint(next_step)));
+    }
+    text
+}
+
+fn summarise_categories(categories: &[inventory::CategoryCount]) -> String {
+    categories
+        .iter()
+        .map(|entry| format!("{} {}", entry.count, entry.category))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 enum Direction {

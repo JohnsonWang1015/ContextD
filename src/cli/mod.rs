@@ -165,6 +165,9 @@ pub enum Command {
     #[command(subcommand)]
     Mcp(commands::mcp::McpCommand),
 
+    /// Summarise what this machine's store holds.
+    Inventory(commands::remote::InventoryArgs),
+
     /// Show configuration and paths.
     Config(commands::config::ConfigArgs),
 }
@@ -231,6 +234,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Import(args) => commands::agent::import(&app, global, &args),
         Command::Export(args) => commands::agent::export(&app, global, &args).await,
         Command::Mcp(command) => commands::mcp::run(&app, global, command).await,
+        Command::Inventory(args) => commands::remote::inventory(&app, global, &args),
         Command::Config(args) => commands::config::run(&app, global, &args).await,
     }
 }
